@@ -1,0 +1,6 @@
+{
+    "name": "forecast-by-vincent",
+    "scripts": {
+        "start": "node main.js"
+    }
+}
