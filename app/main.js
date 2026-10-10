@@ -1,4 +1,6 @@
 import http from 'http';
+import { createHash } from 'node:crypto';
+import cvModule from '@techstark/opencv-js';
 import sharp from 'sharp';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -429,7 +431,7 @@ const page = String.raw`<!doctype html>
                 tileSize: 256,
                 maxNativeZoom: 7,
                 maxZoom: 12,
-                opacity: 0.72,
+                opacity: 1,
                 zIndex: 10,
                 attribution: '<a href="https://www.rainviewer.com/">RainViewer</a>'
             }).addTo(map);
@@ -775,7 +777,9 @@ const page = String.raw`<!doctype html>
 </html>`;
 
 const FORECAST_STEP_SECONDS = 5 * 60;
-const FORECAST_FRAME_DELAY_MS = 180;
+const FORECAST_HORIZON_SECONDS = 90 * 60;
+const FORECAST_FRAME_DELAY_MS = 1000;
+const FORECAST_CACHE_GRACE_MS = 30000;
 const HAMBURG = { latitude: 53.55, longitude: 9.99 };
 
 function parseForecastFrameTime(id) {
@@ -832,11 +836,26 @@ function buildCityOverlaySvg(cities, zoom, center) {
     return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' + text + '</svg>');
 }
 
+function buildTimeOverlaySvg(timestamp) {
+    const time = new Intl.DateTimeFormat('de-DE', {
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'Europe/Berlin'
+    }).format(new Date(timestamp * 1000));
+    return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' +
+        '<rect x="208" y="474" width="96" height="28" rx="3" fill="#fff" fill-opacity="0.88"/>' +
+        '<text x="256" y="488" text-anchor="middle" dominant-baseline="central"' +
+        ' font-family="monospace" font-size="16" font-weight="600" fill="#172a35">' +
+        time + '</text></svg>');
+}
+
 function providerPath(...parts) {
     return parts.join('/').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
 }
 
-function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY) {
+function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY, options) {
+    const includeBase = options.includeBase;
+    const includeRain = options.includeRain;
     const seamask = geo.staticLayer.lsmTopography;
     const topography = geo.staticLayer.rrTopography;
     const topographyIndex = Math.max(0, Math.min(zoom - geo.minZoom, topography.type.length - 1));
@@ -846,8 +865,8 @@ function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY) {
     const seamaskPath = providerPath(geo.staticLayer.path, seamask.path, baseTile + '.png');
     const topographyPath = providerPath(geo.staticLayer.path, topography.path,
         baseTile + '.' + (topography.type[topographyIndex] || 'jpg'));
-    const europeRain = frame.layers.europe && frame.layers.europe.rain;
-    const globalRain = frame.layers.global && frame.layers.global.rain;
+    const europeRain = frame && frame.layers.europe && frame.layers.europe.rain;
+    const globalRain = frame && frame.layers.global && frame.layers.global.rain;
     const rainZoom = Math.min(zoom, (europeRain && europeRain.mnz) || 7);
     const rainScale = Math.pow(2, zoom - rainZoom);
     const rainBaseX = Math.floor(tileX / rainScale) * 2;
@@ -863,14 +882,19 @@ function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY) {
 
     const rainPaths = [rainPath(europeRain, 'sprite'), rainPath(globalRain, 'border')]
         .filter(Boolean).join(';');
-    const tileSet = 'seamask|1;;0;0|' + seamaskPath +
-        '$topo|1;;0;0|' + topographyPath +
-        '$r|' + rainScale + ';;' + rainOffsetX + ';' + rainOffsetY + ';false|' + rainPaths;
+    const layers = [];
+    if (includeBase) {
+        layers.push('seamask|1;;0;0|' + seamaskPath);
+        layers.push('topo|1;;0;0|' + topographyPath);
+    }
+    if (includeRain && rainPaths) {
+        layers.push('r|' + rainScale + ';;' + rainOffsetX + ';' + rainOffsetY + ';false|' + rainPaths);
+    }
     const url = new URL('https://tiles.wo-cloud.com/composite');
     url.searchParams.set('format', 'webp');
     url.searchParams.set('lg', 'rr');
-    url.searchParams.set('tiles', Buffer.from(tileSet).toString('base64'));
-    url.searchParams.set('time', frame.id);
+    url.searchParams.set('tiles', Buffer.from(layers.join('$')).toString('base64'));
+    if (frame) url.searchParams.set('time', frame.id);
     return url;
 }
 
@@ -900,7 +924,101 @@ async function mapWithConcurrency(items, concurrency, task) {
     return results;
 }
 
-async function renderHamburgFrame(frame, geo, cityOverlay, zoom, center, geoTileCache) {
+let openCvPromise;
+
+function loadOpenCv() {
+    if (!openCvPromise) {
+        openCvPromise = Promise.resolve(cvModule).then(async function (module) {
+            let cv = module && module.default ? module.default : module;
+            if (cv instanceof Promise) cv = await cv;
+            if (!cv.Mat) {
+                await new Promise(function (resolve) { cv.onRuntimeInitialized = resolve; });
+            }
+            return cv;
+        });
+    }
+    return openCvPromise;
+}
+
+async function estimateRainFlow(cv, sourceBuffer, targetBuffer) {
+    if (sourceBuffer.length !== 512 * 512 * 4 || targetBuffer.length !== 512 * 512 * 4) {
+        throw new Error('Optical-flow frames must be 512x512 RGBA buffers');
+    }
+    const sourceGray = Buffer.alloc(512 * 512);
+    const targetGray = Buffer.alloc(512 * 512);
+    for (let pixel = 0; pixel < sourceGray.length; pixel += 1) {
+        const offset = pixel * 4;
+        sourceGray[pixel] = sourceBuffer[offset + 3] === 0 ? 0 :
+            255 - Math.min(sourceBuffer[offset], sourceBuffer[offset + 1], sourceBuffer[offset + 2]);
+        targetGray[pixel] = targetBuffer[offset + 3] === 0 ? 0 :
+            255 - Math.min(targetBuffer[offset], targetBuffer[offset + 1], targetBuffer[offset + 2]);
+    }
+
+    const sourceMat = new cv.Mat(512, 512, cv.CV_8UC1);
+    const targetMat = new cv.Mat(512, 512, cv.CV_8UC1);
+    const flowMat = new cv.Mat();
+    try {
+        sourceMat.data.set(sourceGray);
+        targetMat.data.set(targetGray);
+        cv.calcOpticalFlowFarneback(sourceMat, targetMat, flowMat, 0.5, 4, 21, 4, 5, 1.2, 0);
+        return Float32Array.from(flowMat.data32F);
+    } finally {
+        sourceMat.delete();
+        targetMat.delete();
+        flowMat.delete();
+    }
+}
+
+function advectRainImage(source, flow, fraction) {
+    const pixelCount = 512 * 512;
+    const output = Buffer.alloc(pixelCount * 4);
+
+    function sampleField(x, y, channel) {
+        const left = Math.max(0, Math.min(511, Math.floor(x)));
+        const top = Math.max(0, Math.min(511, Math.floor(y)));
+        const right = Math.min(511, left + 1);
+        const bottom = Math.min(511, top + 1);
+        const dx = Math.max(0, Math.min(1, x - left));
+        const dy = Math.max(0, Math.min(1, y - top));
+        const upper = flow[(top * 512 + left) * 2 + channel] * (1 - dx) +
+            flow[(top * 512 + right) * 2 + channel] * dx;
+        const lower = flow[(bottom * 512 + left) * 2 + channel] * (1 - dx) +
+            flow[(bottom * 512 + right) * 2 + channel] * dx;
+        return upper * (1 - dy) + lower * dy;
+    }
+
+    function sampleColor(x, y, channel) {
+        const left = Math.max(0, Math.min(511, Math.floor(x)));
+        const top = Math.max(0, Math.min(511, Math.floor(y)));
+        const right = Math.min(511, left + 1);
+        const bottom = Math.min(511, top + 1);
+        const dx = Math.max(0, Math.min(1, x - left));
+        const dy = Math.max(0, Math.min(1, y - top));
+        const upper = source[(top * 512 + left) * 4 + channel] * (1 - dx) +
+            source[(top * 512 + right) * 4 + channel] * dx;
+        const lower = source[(bottom * 512 + left) * 4 + channel] * (1 - dx) +
+            source[(bottom * 512 + right) * 4 + channel] * dx;
+        return Math.round(upper * (1 - dy) + lower * dy);
+    }
+
+    for (let y = 0; y < 512; y += 1) {
+        for (let x = 0; x < 512; x += 1) {
+            let sourceX = x;
+            let sourceY = y;
+            for (let iteration = 0; iteration < 3; iteration += 1) {
+                sourceX = x - sampleField(sourceX, sourceY, 0) * fraction;
+                sourceY = y - sampleField(sourceX, sourceY, 1) * fraction;
+            }
+            const outputOffset = (y * 512 + x) * 4;
+            for (let channel = 0; channel < 4; channel += 1) {
+                output[outputOffset + channel] = sampleColor(sourceX, sourceY, channel);
+            }
+        }
+    }
+    return output;
+}
+
+async function renderHamburgFrame(frame, geo, zoom, center, geoTileCache, layerMode) {
     const firstTileX = Math.floor((center.x - 256) / 512);
     const firstTileY = Math.floor((center.y - 256) / 512);
     const cropLeft = Math.round(center.x - firstTileX * 512 - 256);
@@ -919,19 +1037,27 @@ async function renderHamburgFrame(frame, geo, cityOverlay, zoom, center, geoTile
     }
 
     const blankTile = await sharp({
-        create: { width: 512, height: 512, channels: 4, background: '#fff' }
+        create: { width: 512, height: 512, channels: 4,
+            background: layerMode === 'rain' ? { r: 0, g: 0, b: 0, alpha: 0 } : '#fff' }
     }).png().toBuffer();
     const fetchedTiles = await Promise.all(positions.map(async function (position) {
         const geoKey = position.x + ':' + position.y;
-        if (!geoTileCache.has(geoKey)) {
+        if (layerMode === 'base' && !geoTileCache.has(geoKey)) {
             geoTileCache.set(geoKey, fetchProviderBuffer(
                 buildGeoOverlayUrl(geo, zoom, position.x, position.y), true
             ));
         }
 
         const [mapTile, geoTile] = await Promise.all([
-            fetchProviderBuffer(buildCompositeTileUrl(frame, geo, zoom, position.x, position.y), true),
-            geoTileCache.get(geoKey)
+            fetchProviderBuffer(buildCompositeTileUrl(
+                layerMode === 'rain' ? frame : null,
+                geo,
+                zoom,
+                position.x,
+                position.y,
+                { includeBase: layerMode === 'base', includeRain: layerMode === 'rain' }
+            ), true),
+            layerMode === 'base' ? geoTileCache.get(geoKey) : null
         ]);
         return { position: position, mapTile: mapTile, geoTile: geoTile };
     }));
@@ -954,14 +1080,15 @@ async function renderHamburgFrame(frame, geo, cityOverlay, zoom, center, geoTile
     }
 
     const mosaic = await sharp({
-        create: { width: 1024, height: 1024, channels: 4, background: '#fff' }
+        create: { width: 1024, height: 1024, channels: 4,
+            background: layerMode === 'rain' ? { r: 0, g: 0, b: 0, alpha: 0 } : '#fff' }
     }).composite(mapLayers.concat(geoLayers)).png().toBuffer();
 
     const cropped = await sharp(mosaic)
         .extract({ left: cropLeft, top: cropTop, width: 512, height: 512 })
         .png()
         .toBuffer();
-    return sharp(cropped).composite([{ input: cityOverlay }]).png().toBuffer();
+    return cropped;
 }
 
 async function generateForecastGif() {
@@ -1012,31 +1139,87 @@ async function generateForecastGif() {
     const futureFrames = availableFrames.filter(function (frame) { return frame.time > now; });
     if (!futureFrames.length) throw new Error('WetterOnline has no future forecast frames');
 
-    const forecastEnd = futureFrames[futureFrames.length - 1].time;
-    const steps = [];
-    for (let time = now; time <= forecastEnd; time += FORECAST_STEP_SECONDS) {
-        let frame = availableFrames[0];
-        availableFrames.forEach(function (candidate) {
-            if (candidate.time <= time) frame = candidate;
-        });
-        steps.push({ time: time, frame: frame });
-    }
-    if (!steps.length) throw new Error('WetterOnline forecast produced no animation frames');
+    const steps = Array.from({ length: FORECAST_HORIZON_SECONDS / FORECAST_STEP_SECONDS + 1 },
+        function (_, index) {
+            const time = now + index * FORECAST_STEP_SECONDS;
+            const nextIndex = availableFrames.findIndex(function (frame) { return frame.time >= time; });
+            if (nextIndex === -1) {
+                const lastFrame = availableFrames[availableFrames.length - 1];
+                return { time: time, before: lastFrame, after: lastFrame, amount: 0 };
+            }
 
-    const uniqueFrames = Array.from(new Map(steps.map(function (step) {
-        return [step.frame.id, step.frame];
-    })).values());
+            const after = availableFrames[nextIndex];
+            const before = after.time === time || nextIndex === 0 ? after : availableFrames[nextIndex - 1];
+            const amount = after.time === before.time ? 0 :
+                Math.max(0, Math.min(1, (time - before.time) / (after.time - before.time)));
+            return { time: time, before: before, after: after, amount: amount };
+        });
+
+    const sourceFrames = new Map();
+    steps.forEach(function (step) {
+        sourceFrames.set(step.before.id, step.before);
+        sourceFrames.set(step.after.id, step.after);
+    });
+    const uniqueFrames = Array.from(sourceFrames.values());
     const center = projectMercator(HAMBURG.latitude, HAMBURG.longitude, zoom);
     const cityOverlay = buildCityOverlaySvg(cities, zoom, center);
     const geoTileCache = new Map();
-    const rendered = await mapWithConcurrency(uniqueFrames, 3, async function (frame) {
-        return {
-            id: frame.id,
-            image: await renderHamburgFrame(frame, geo, cityOverlay, zoom, center, geoTileCache)
-        };
+    const [baseImage, renderedRainFrames] = await Promise.all([
+        renderHamburgFrame(null, geo, zoom, center, geoTileCache, 'base'),
+        mapWithConcurrency(uniqueFrames, 3, async function (frame) {
+            return {
+                id: frame.id,
+                image: await renderHamburgFrame(frame, geo, zoom, center, new Map(), 'rain')
+            };
+        })
+    ]);
+    const rainImageById = new Map(renderedRainFrames.map(function (frame) { return [frame.id, frame.image]; }));
+    const rawRainById = new Map();
+    const flowByPair = new Map();
+    const cv = await loadOpenCv();
+
+    function getRawRain(frame) {
+        if (!rawRainById.has(frame.id)) {
+            rawRainById.set(frame.id, sharp(rainImageById.get(frame.id))
+                .ensureAlpha()
+                .raw()
+                .toBuffer({ resolveWithObject: true }));
+        }
+        return rawRainById.get(frame.id);
+    }
+
+    function getFlow(sourceFrame, targetFrame) {
+        const key = sourceFrame.id + '>' + targetFrame.id;
+        if (!flowByPair.has(key)) {
+            flowByPair.set(key, Promise.all([getRawRain(sourceFrame), getRawRain(targetFrame)])
+                .then(function (images) { return estimateRainFlow(cv, images[0].data, images[1].data); }));
+        }
+        return flowByPair.get(key);
+    }
+
+    const images = await mapWithConcurrency(steps, 3, async function (step) {
+        let rainImage = rainImageById.get(step.before.id);
+        if (step.before.id !== step.after.id && step.amount > 0) {
+            const useAfter = step.amount > 0.5;
+            const sourceFrame = useAfter ? step.after : step.before;
+            const targetFrame = useAfter ? step.before : step.after;
+            const fraction = useAfter ? 1 - step.amount : step.amount;
+            const [source, flow] = await Promise.all([
+                getRawRain(sourceFrame),
+                getFlow(sourceFrame, targetFrame)
+            ]);
+            const advected = advectRainImage(source.data, flow, fraction);
+            rainImage = await sharp(advected, {
+                raw: { width: 512, height: 512, channels: 4 }
+            }).png().toBuffer();
+        }
+
+        return sharp(baseImage).composite([
+            { input: rainImage },
+            { input: cityOverlay },
+            { input: buildTimeOverlaySvg(step.time) }
+        ]).png().toBuffer();
     });
-    const imageById = new Map(rendered.map(function (frame) { return [frame.id, frame.image]; }));
-    const images = steps.map(function (step) { return imageById.get(step.frame.id); });
     const gif = await sharp(images, {
         join: { animated: true, across: 1, background: '#fff' }
     }).gif({
@@ -1055,7 +1238,46 @@ async function generateForecastGif() {
     };
 }
 
+let forecastCache;
 let forecastGeneration;
+
+function getCachedForecastGif() {
+    if (forecastCache && Date.now() < forecastCache.expiresAt) {
+        return Promise.resolve(forecastCache);
+    }
+    if (!forecastGeneration) {
+        forecastGeneration = generateForecastGif().then(function (result) {
+            const intervalMilliseconds = FORECAST_STEP_SECONDS * 1000;
+            const nextBoundary = (Math.floor(result.start * 1000 / intervalMilliseconds) + 1) * intervalMilliseconds;
+            forecastCache = {
+                ...result,
+                expiresAt: nextBoundary + FORECAST_CACHE_GRACE_MS,
+                etag: '"' + createHash('sha256').update(result.data).digest('hex') + '"'
+            };
+            return forecastCache;
+        }).finally(function () {
+            forecastGeneration = undefined;
+        });
+    }
+    return forecastGeneration;
+}
+
+function forecastResponseHeaders(result) {
+    const maxAge = Math.max(0, Math.floor((result.expiresAt - Date.now()) / 1000));
+    return {
+        'Content-Type': 'image/gif',
+        'Content-Length': result.data.length,
+        'Cache-Control': 'public, max-age=' + maxAge + ', must-revalidate',
+        'Expires': new Date(result.expiresAt).toUTCString(),
+        'ETag': result.etag,
+        'X-Forecast-Zoom': String(result.zoom),
+        'X-Forecast-Frames': String(result.frames),
+        'X-Forecast-Start': new Date(result.start * 1000).toISOString(),
+        'X-Forecast-End': new Date(result.end * 1000).toISOString(),
+        'X-Forecast-Cache-Until': new Date(result.expiresAt).toISOString(),
+        'X-Forecast-Source': 'WetterOnline RegenRadar'
+    };
+}
 
 const server = http.createServer(async (req, res) => {
     if (req.url === '/healthz') {
@@ -1073,26 +1295,19 @@ const server = http.createServer(async (req, res) => {
         }
 
         try {
-            if (!forecastGeneration) forecastGeneration = generateForecastGif();
-            const generation = forecastGeneration;
-            const result = await generation;
-            res.writeHead(200, {
-                'Content-Type': 'image/gif',
-                'Content-Length': result.data.length,
-                'Cache-Control': 'no-store',
-                'X-Forecast-Zoom': String(result.zoom),
-                'X-Forecast-Frames': String(result.frames),
-                'X-Forecast-Start': new Date(result.start * 1000).toISOString(),
-                'X-Forecast-End': new Date(result.end * 1000).toISOString(),
-                'X-Forecast-Source': 'WetterOnline RegenRadar'
-            });
+            const result = await getCachedForecastGif();
+            const headers = forecastResponseHeaders(result);
+            if (req.headers['if-none-match'] === result.etag) {
+                res.writeHead(304, headers);
+                res.end();
+                return;
+            }
+            res.writeHead(200, headers);
             res.end(result.data);
         } catch (error) {
             console.error('Forecast GIF generation failed:', error);
             res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
             res.end('WetterOnline forecast GIF generation failed');
-        } finally {
-            forecastGeneration = undefined;
         }
         return;
     }
