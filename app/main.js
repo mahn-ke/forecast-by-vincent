@@ -1136,6 +1136,7 @@ async function generateForecastGif(location) {
     const highStep = Number(geo.timeRangeConfig.periodCurrentHighRes.timeResolution[sourceZoom] || 5);
     const lowStep = Number(geo.timeRangeConfig.periodCurrentLowRes.timeResolution[sourceZoom] || 15);
     const now = Date.now() / 1000;
+    const startTime = Math.ceil(now / FORECAST_STEP_SECONDS) * FORECAST_STEP_SECONDS;
     const candidates = new Map();
 
     [
@@ -1166,11 +1167,14 @@ async function generateForecastGif(location) {
 
     const steps = Array.from({ length: FORECAST_HORIZON_SECONDS / FORECAST_STEP_SECONDS + 1 },
         function (_, index) {
-            const time = now + index * FORECAST_STEP_SECONDS;
+            const time = startTime + index * FORECAST_STEP_SECONDS;
             const nextIndex = availableFrames.findIndex(function (frame) { return frame.time >= time; });
             if (nextIndex === -1) {
-                const lastFrame = availableFrames[availableFrames.length - 1];
-                return { time: time, before: lastFrame, after: lastFrame, amount: 0 };
+                const after = availableFrames[availableFrames.length - 1];
+                const before = availableFrames[availableFrames.length - 2] || after;
+                const interval = Math.max(FORECAST_STEP_SECONDS, after.time - before.time);
+                const amount = before === after ? 1 : 1 + (time - after.time) / interval;
+                return { time: time, before: before, after: after, amount: amount, extrapolate: before !== after };
             }
 
             const after = availableFrames[nextIndex];
@@ -1226,12 +1230,16 @@ async function generateForecastGif(location) {
         let rainImage = rainImageById.get(step.before.id);
         if (step.before.id !== step.after.id && step.amount > 0) {
             const useAfter = step.amount > 0.5;
-            const sourceFrame = useAfter ? step.after : step.before;
-            const targetFrame = useAfter ? step.before : step.after;
-            const fraction = useAfter ? 1 - step.amount : step.amount;
+            const sourceFrame = step.extrapolate ? step.after :
+                (useAfter ? step.after : step.before);
+            const flowSource = step.extrapolate ? step.before : sourceFrame;
+            const flowTarget = step.extrapolate ? step.after :
+                (useAfter ? step.before : step.after);
+            const fraction = step.extrapolate ? step.amount - 1 :
+                (useAfter ? 1 - step.amount : step.amount);
             const [source, flow] = await Promise.all([
                 getRawRain(sourceFrame),
-                getFlow(sourceFrame, targetFrame)
+                getFlow(flowSource, flowTarget)
             ]);
             const advected = advectRainImage(source.data, flow, fraction);
             rainImage = await sharp(advected, {
