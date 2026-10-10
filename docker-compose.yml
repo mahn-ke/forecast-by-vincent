@@ -10,7 +10,7 @@ services:
     ports:
       - "3015:3000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3015/healthz"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
       interval: 30s
       timeout: 10s
       retries: 5

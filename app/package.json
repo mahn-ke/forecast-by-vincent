@@ -2,5 +2,8 @@
     "name": "forecast-by-vincent",
     "scripts": {
         "start": "node main.js"
+    },
+    "dependencies": {
+        "sharp": "^0.35.5"
     }
 }
