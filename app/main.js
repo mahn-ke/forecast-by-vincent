@@ -778,8 +778,9 @@ const page = String.raw`<!doctype html>
 
 const FORECAST_STEP_SECONDS = 5 * 60;
 const FORECAST_HORIZON_SECONDS = 90 * 60;
-const FORECAST_FRAME_DELAY_MS = 1000;
+const FORECAST_FRAME_DELAY_MS = 500;
 const FORECAST_CACHE_GRACE_MS = 30000;
+const MAX_FORECAST_ZOOM = 100;
 const HAMBURG = { latitude: 53.55, longitude: 9.99 };
 
 function parseForecastFrameTime(id) {
@@ -843,9 +844,9 @@ function buildTimeOverlaySvg(timestamp) {
         timeZone: 'Europe/Berlin'
     }).format(new Date(timestamp * 1000));
     return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' +
-        '<rect x="208" y="474" width="96" height="28" rx="3" fill="#fff" fill-opacity="0.88"/>' +
-        '<text x="256" y="488" text-anchor="middle" dominant-baseline="central"' +
-        ' font-family="monospace" font-size="16" font-weight="600" fill="#172a35">' +
+        '<rect x="0" y="392" width="512" height="120" fill="#fff" fill-opacity="0.7"/>' +
+        '<text x="256" y="452" text-anchor="middle" dominant-baseline="central"' +
+        ' font-family="monospace" font-size="100" font-weight="600" fill="#172a35">' +
         time + '</text></svg>');
 }
 
@@ -908,7 +909,9 @@ async function fetchProviderBuffer(url, allowMissing) {
     const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
     if (allowMissing && response.status === 404) return null;
     if (!response.ok) throw new Error('WetterOnline returned HTTP ' + response.status);
-    return Buffer.from(await response.arrayBuffer());
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (allowMissing && buffer.length === 0) return null;
+    return buffer;
 }
 
 async function mapWithConcurrency(items, concurrency, task) {
@@ -1062,6 +1065,21 @@ async function renderHamburgFrame(frame, geo, zoom, center, geoTileCache, layerM
         return { position: position, mapTile: mapTile, geoTile: geoTile };
     }));
 
+    if (layerMode === 'base') {
+        const hasVisibleBasemap = await Promise.all(fetchedTiles.map(async function (tile) {
+            if (!tile.mapTile) return false;
+            const stats = await sharp(tile.mapTile).stats();
+            return stats.channels.slice(0, 3).some(function (channel) {
+                return channel.min < 245 || channel.max < 250;
+            });
+        })).then(function (results) { return results.some(Boolean); });
+        if (!hasVisibleBasemap) {
+            const error = new Error('WetterOnline returned no basemap tiles; x is longitude and y is latitude.');
+            error.statusCode = 422;
+            throw error;
+        }
+    }
+
     const mapLayers = [];
     const geoLayers = [];
     for (const tile of fetchedTiles) {
@@ -1091,7 +1109,7 @@ async function renderHamburgFrame(frame, geo, zoom, center, geoTileCache, layerM
     return cropped;
 }
 
-async function generateForecastGif() {
+async function generateForecastGif(location) {
     const metadataUrls = [
         'https://tiles.wo-cloud.com/metadata?type=geo',
         'https://tiles.wo-cloud.com/metadata?lg=wr&period=periodCurrentHighRes&type=period',
@@ -1107,9 +1125,16 @@ async function generateForecastGif() {
         if (index === 3 && !response.ok) return {};
         return response.json();
     }));
-    const zoom = Number(geo.maxZoom);
-    const highStep = Number(geo.timeRangeConfig.periodCurrentHighRes.timeResolution[zoom] || 5);
-    const lowStep = Number(geo.timeRangeConfig.periodCurrentLowRes.timeResolution[zoom] || 15);
+    const zoom = location.zoom === undefined ? Number(geo.maxZoom) : location.zoom;
+    if (zoom < Number(geo.minZoom) || zoom > MAX_FORECAST_ZOOM) {
+        const error = new RangeError('Zoom must be between ' + geo.minZoom + ' and ' + MAX_FORECAST_ZOOM);
+        error.statusCode = 400;
+        throw error;
+    }
+    const sourceZoom = Math.min(zoom, Number(geo.maxZoom));
+    const overzoomScale = zoom > sourceZoom ? zoom / sourceZoom : 1;
+    const highStep = Number(geo.timeRangeConfig.periodCurrentHighRes.timeResolution[sourceZoom] || 5);
+    const lowStep = Number(geo.timeRangeConfig.periodCurrentLowRes.timeResolution[sourceZoom] || 15);
     const now = Date.now() / 1000;
     const candidates = new Map();
 
@@ -1161,15 +1186,15 @@ async function generateForecastGif() {
         sourceFrames.set(step.after.id, step.after);
     });
     const uniqueFrames = Array.from(sourceFrames.values());
-    const center = projectMercator(HAMBURG.latitude, HAMBURG.longitude, zoom);
-    const cityOverlay = buildCityOverlaySvg(cities, zoom, center);
+    const center = projectMercator(location.y, location.x, sourceZoom);
+    const cityOverlay = buildCityOverlaySvg(cities, sourceZoom, center);
     const geoTileCache = new Map();
     const [baseImage, renderedRainFrames] = await Promise.all([
-        renderHamburgFrame(null, geo, zoom, center, geoTileCache, 'base'),
+        renderHamburgFrame(null, geo, sourceZoom, center, geoTileCache, 'base'),
         mapWithConcurrency(uniqueFrames, 3, async function (frame) {
             return {
                 id: frame.id,
-                image: await renderHamburgFrame(frame, geo, zoom, center, new Map(), 'rain')
+                image: await renderHamburgFrame(frame, geo, sourceZoom, center, new Map(), 'rain')
             };
         })
     ]);
@@ -1214,11 +1239,21 @@ async function generateForecastGif() {
             }).png().toBuffer();
         }
 
-        return sharp(baseImage).composite([
+        const mapFrame = await sharp(baseImage).composite([
             { input: rainImage },
-            { input: cityOverlay },
-            { input: buildTimeOverlaySvg(step.time) }
+            { input: cityOverlay }
         ]).png().toBuffer();
+        let centeredFrame = mapFrame;
+        if (overzoomScale > 1) {
+            const cropSize = Math.max(1, Math.round(512 / overzoomScale));
+            const cropStart = Math.floor((512 - cropSize) / 2);
+            centeredFrame = await sharp(mapFrame)
+                .extract({ left: cropStart, top: cropStart, width: cropSize, height: cropSize })
+                .resize(512, 512, { fit: 'fill' })
+                .png()
+                .toBuffer();
+        }
+        return sharp(centeredFrame).composite([{ input: buildTimeOverlaySvg(step.time) }]).png().toBuffer();
     });
     const gif = await sharp(images, {
         join: { animated: true, across: 1, background: '#fff' }
@@ -1232,34 +1267,51 @@ async function generateForecastGif() {
     return {
         data: gif,
         zoom: zoom,
+        sourceZoom: sourceZoom,
+        x: location.x,
+        y: location.y,
         start: steps[0].time,
         end: steps[steps.length - 1].time,
         frames: steps.length
     };
 }
 
-let forecastCache;
-let forecastGeneration;
+const FORECAST_CACHE_MAX_ENTRIES = 8;
+const forecastCache = new Map();
+const forecastGeneration = new Map();
 
-function getCachedForecastGif() {
-    if (forecastCache && Date.now() < forecastCache.expiresAt) {
-        return Promise.resolve(forecastCache);
+function getCachedForecastGif(location) {
+    const cacheKey = [location.x.toFixed(6), location.y.toFixed(6),
+        location.zoom === undefined ? 'max' : String(location.zoom)].join(':');
+    const cached = forecastCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+        forecastCache.delete(cacheKey);
+        forecastCache.set(cacheKey, cached);
+        return Promise.resolve(cached);
     }
-    if (!forecastGeneration) {
-        forecastGeneration = generateForecastGif().then(function (result) {
+    forecastCache.delete(cacheKey);
+
+    let generation = forecastGeneration.get(cacheKey);
+    if (!generation) {
+        generation = generateForecastGif(location).then(function (result) {
             const intervalMilliseconds = FORECAST_STEP_SECONDS * 1000;
             const nextBoundary = (Math.floor(result.start * 1000 / intervalMilliseconds) + 1) * intervalMilliseconds;
-            forecastCache = {
+            const entry = {
                 ...result,
                 expiresAt: nextBoundary + FORECAST_CACHE_GRACE_MS,
                 etag: '"' + createHash('sha256').update(result.data).digest('hex') + '"'
             };
-            return forecastCache;
+            forecastCache.set(cacheKey, entry);
+            while (forecastCache.size > FORECAST_CACHE_MAX_ENTRIES) {
+                forecastCache.delete(forecastCache.keys().next().value);
+            }
+            return entry;
         }).finally(function () {
-            forecastGeneration = undefined;
+            forecastGeneration.delete(cacheKey);
         });
+        forecastGeneration.set(cacheKey, generation);
     }
-    return forecastGeneration;
+    return generation;
 }
 
 function forecastResponseHeaders(result) {
@@ -1271,6 +1323,9 @@ function forecastResponseHeaders(result) {
         'Expires': new Date(result.expiresAt).toUTCString(),
         'ETag': result.etag,
         'X-Forecast-Zoom': String(result.zoom),
+        'X-Forecast-Source-Zoom': String(result.sourceZoom),
+        'X-Forecast-X': String(result.x),
+        'X-Forecast-Y': String(result.y),
         'X-Forecast-Frames': String(result.frames),
         'X-Forecast-Start': new Date(result.start * 1000).toISOString(),
         'X-Forecast-End': new Date(result.end * 1000).toISOString(),
@@ -1295,7 +1350,28 @@ const server = http.createServer(async (req, res) => {
         }
 
         try {
-            const result = await getCachedForecastGif();
+            const xParameter = requestUrl.searchParams.get('x');
+            const yParameter = requestUrl.searchParams.get('y');
+            const zoomParameter = requestUrl.searchParams.get('zoom');
+            const location = {
+                x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
+                y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
+                zoom: zoomParameter === null ? undefined : Number(zoomParameter)
+            };
+
+            if (!Number.isFinite(location.x) || location.x < -180 || location.x > 180 ||
+                !Number.isFinite(location.y) || location.y < -90 || location.y > 90) {
+                const error = new RangeError('x must be longitude (-180..180) and y latitude (-90..90)');
+                error.statusCode = 400;
+                throw error;
+            }
+            if (zoomParameter !== null && (!Number.isInteger(location.zoom) || location.zoom < 0 || location.zoom > MAX_FORECAST_ZOOM)) {
+                const error = new RangeError('zoom must be an integer between 0 and ' + MAX_FORECAST_ZOOM);
+                error.statusCode = 400;
+                throw error;
+            }
+
+            const result = await getCachedForecastGif(location);
             const headers = forecastResponseHeaders(result);
             if (req.headers['if-none-match'] === result.etag) {
                 res.writeHead(304, headers);
@@ -1306,8 +1382,11 @@ const server = http.createServer(async (req, res) => {
             res.end(result.data);
         } catch (error) {
             console.error('Forecast GIF generation failed:', error);
-            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-            res.end('WetterOnline forecast GIF generation failed');
+            res.writeHead(error.statusCode || 502, {
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': 'no-store'
+            });
+            res.end(error.statusCode ? error.message : 'WetterOnline forecast GIF generation failed');
         }
         return;
     }
