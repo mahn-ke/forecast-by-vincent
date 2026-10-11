@@ -6,7 +6,7 @@ services:
     image: ghcr.io/mahn-ke/forecast-by-vincent:latest@sha256:76e3f09aa52c850b5981bcf708485fbb5958c5e246914e3b035a60a75a96c76c
     restart: on-failure:5
     environment:
-      - PORT=3015
+      - PORT=3000
     ports:
       - "3015:3000"
     healthcheck:
