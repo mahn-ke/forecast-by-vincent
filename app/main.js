@@ -338,6 +338,12 @@ async function renderHamburgFrame(frame, geo, zoom, center, geoTileCache, layerM
 }
 
 async function generateForecastGif(location) {
+    const renderStartedAt = Date.now();
+    console.info('[forecast] render started', {
+        x: location.x,
+        y: location.y,
+        zoom: location.zoom === undefined ? 'provider-max' : location.zoom
+    });
     const metadataUrls = [
         'https://tiles.wo-cloud.com/metadata?type=geo',
         'https://tiles.wo-cloud.com/metadata?lg=wr&period=periodCurrentHighRes&type=period',
@@ -411,6 +417,12 @@ async function generateForecastGif(location) {
                 Math.max(0, Math.min(1, (time - before.time) / (after.time - before.time)));
             return { time: time, before: before, after: after, amount: amount };
         });
+    console.info('[forecast] metadata ready', {
+        nativeFrames: new Set(steps.flatMap(function (step) { return [step.before.id, step.after.id]; })).size,
+        outputFrames: steps.length,
+        sourceZoom: sourceZoom,
+        elapsedSeconds: ((Date.now() - renderStartedAt) / 1000).toFixed(1)
+    });
 
     const sourceFrames = new Map();
     steps.forEach(function (step) {
@@ -421,12 +433,18 @@ async function generateForecastGif(location) {
     const center = projectMercator(location.y, location.x, sourceZoom);
     const cityOverlay = buildCityOverlaySvg(cities, sourceZoom, center);
     const geoTileCache = new Map();
+    let nativeFramesCompleted = 0;
+    const nativeFrameStartedAt = Date.now();
     const [baseImage, renderedRainFrames] = await Promise.all([
         renderHamburgFrame(null, geo, sourceZoom, center, geoTileCache, 'base'),
         mapWithConcurrency(uniqueFrames, 3, async function (frame) {
+            const image = await renderHamburgFrame(frame, geo, sourceZoom, center, new Map(), 'rain');
+            nativeFramesCompleted += 1;
+            console.info('[forecast] native frame ' + nativeFramesCompleted + '/' + uniqueFrames.length +
+                ' completed in ' + ((Date.now() - nativeFrameStartedAt) / 1000).toFixed(1) + 's', frame.id);
             return {
                 id: frame.id,
-                image: await renderHamburgFrame(frame, geo, sourceZoom, center, new Map(), 'rain')
+                image: image
             };
         })
     ]);
@@ -454,7 +472,9 @@ async function generateForecastGif(location) {
         return flowByPair.get(key);
     }
 
-    const images = await mapWithConcurrency(steps, 3, async function (step) {
+    const outputStartedAt = Date.now();
+    const images = await mapWithConcurrency(steps, 3, async function (step, frameIndex) {
+        const frameStartedAt = Date.now();
         let rainImage = rainImageById.get(step.before.id);
         if (step.before.id !== step.after.id && step.amount > 0) {
             const useAfter = step.amount > 0.5;
@@ -489,7 +509,15 @@ async function generateForecastGif(location) {
                 .png()
                 .toBuffer();
         }
-        return sharp(centeredFrame).composite([{ input: buildTimeOverlaySvg(step.time) }]).png().toBuffer();
+        const image = await sharp(centeredFrame)
+            .composite([{ input: buildTimeOverlaySvg(step.time) }])
+            .png()
+            .toBuffer();
+        console.info('[forecast] frame ' + (frameIndex + 1) + '/' + steps.length +
+            ' (+ ' + (frameIndex * FORECAST_STEP_SECONDS / 60) + ' min) completed in ' +
+            ((Date.now() - frameStartedAt) / 1000).toFixed(2) + 's; render elapsed ' +
+            ((Date.now() - renderStartedAt) / 1000).toFixed(1) + 's');
+        return image;
     });
     const gif = await sharp(images, {
         join: { animated: true, across: 1, background: '#fff' }
@@ -499,6 +527,12 @@ async function generateForecastGif(location) {
         keepDuplicateFrames: true,
         effort: 5
     }).toBuffer();
+    console.info('[forecast] GIF encoded', {
+        frames: steps.length,
+        bytes: gif.length,
+        renderSeconds: ((Date.now() - renderStartedAt) / 1000).toFixed(1),
+        encodeSeconds: ((Date.now() - outputStartedAt) / 1000).toFixed(1)
+    });
 
     return {
         data: gif,
@@ -523,12 +557,29 @@ function getCachedForecastGif(location) {
     if (cached && Date.now() < cached.expiresAt) {
         forecastCache.delete(cacheKey);
         forecastCache.set(cacheKey, cached);
-        return Promise.resolve(cached);
+        return Promise.resolve({ result: cached, stale: false });
     }
-    forecastCache.delete(cacheKey);
+    if (cached) {
+        startForecastGeneration(location, cacheKey).catch(function (error) {
+            console.error('[forecast] background refresh failed:', error);
+        });
+        return Promise.resolve({ result: cached, stale: true });
+    }
 
+    return startForecastGeneration(location, cacheKey).then(function (result) {
+        return { result: result, stale: false };
+    });
+}
+
+function startForecastGeneration(location, cacheKey) {
     let generation = forecastGeneration.get(cacheKey);
     if (!generation) {
+        const generationStartedAt = Date.now();
+        console.info('[forecast] generation started', {
+            x: location.x,
+            y: location.y,
+            zoom: location.zoom === undefined ? 'provider-max' : location.zoom
+        });
         generation = generateForecastGif(location).then(function (result) {
             const intervalMilliseconds = FORECAST_STEP_SECONDS * 1000;
             const nextBoundary = (Math.floor(result.start * 1000 / intervalMilliseconds) + 1) * intervalMilliseconds;
@@ -541,6 +592,14 @@ function getCachedForecastGif(location) {
             while (forecastCache.size > FORECAST_CACHE_MAX_ENTRIES) {
                 forecastCache.delete(forecastCache.keys().next().value);
             }
+            console.info('[forecast] cache refreshed', {
+                x: result.x,
+                y: result.y,
+                zoom: result.zoom,
+                frames: result.frames,
+                cacheUntil: new Date(entry.expiresAt).toISOString(),
+                renderSeconds: ((Date.now() - generationStartedAt) / 1000).toFixed(1)
+            });
             return entry;
         }).finally(function () {
             forecastGeneration.delete(cacheKey);
@@ -550,14 +609,16 @@ function getCachedForecastGif(location) {
     return generation;
 }
 
-function forecastResponseHeaders(result) {
+function forecastResponseHeaders(result, stale) {
     const maxAge = Math.max(0, Math.floor((result.expiresAt - Date.now()) / 1000));
     return {
         'Content-Type': 'image/gif',
         'Content-Length': result.data.length,
-        'Cache-Control': 'public, max-age=' + maxAge + ', must-revalidate',
+        'Cache-Control': stale ? 'public, max-age=0, stale-while-revalidate=300' :
+            'public, max-age=' + maxAge + ', must-revalidate',
         'Expires': new Date(result.expiresAt).toUTCString(),
         'ETag': result.etag,
+        'X-Forecast-Stale': String(stale),
         'X-Forecast-Zoom': String(result.zoom),
         'X-Forecast-Source-Zoom': String(result.sourceZoom),
         'X-Forecast-X': String(result.x),
@@ -607,8 +668,9 @@ const server = http.createServer(async (req, res) => {
                 throw error;
             }
 
-            const result = await getCachedForecastGif(location);
-            const headers = forecastResponseHeaders(result);
+            const cached = await getCachedForecastGif(location);
+            const result = cached.result;
+            const headers = forecastResponseHeaders(result, cached.stale);
             if (req.headers['if-none-match'] === result.etag) {
                 res.writeHead(304, headers);
                 res.end();
@@ -633,4 +695,19 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
+    const defaultLocation = { x: HAMBURG.longitude, y: HAMBURG.latitude };
+    const defaultCacheKey = [defaultLocation.x.toFixed(6), defaultLocation.y.toFixed(6), 'max'].join(':');
+    const warmupStartedAt = Date.now();
+    console.info('[forecast] startup warm-up started', defaultLocation);
+    startForecastGeneration(defaultLocation, defaultCacheKey)
+        .then(function (result) {
+            console.info('[forecast] startup warm-up ready', {
+                frames: result.frames,
+                zoom: result.zoom,
+                seconds: ((Date.now() - warmupStartedAt) / 1000).toFixed(1)
+            });
+        })
+        .catch(function (error) {
+            console.error('[forecast] startup warm-up failed', error);
+        });
 });
