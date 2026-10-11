@@ -57,7 +57,7 @@ function buildCityOverlaySvg(cities, zoom, center) {
 
     const text = labels.map(function (city) {
         return '<text x="' + city.x.toFixed(1) + '" y="' + city.y.toFixed(1) +
-            '" text-anchor="middle" dominant-baseline="central" font-family="Arial,sans-serif"' +
+            '" text-anchor="middle" dominant-baseline="central" font-family="Fira Sans,sans-serif"' +
             ' font-size="12" fill="#172229" stroke="#fff" stroke-width="3"' +
             ' stroke-linejoin="round" paint-order="stroke">' + escapeXml(city.name) + '</text>';
     }).join('');
@@ -74,7 +74,7 @@ function buildTimeOverlaySvg(timestamp) {
     return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' +
         '<rect x="0" y="392" width="512" height="120" fill="#fff" fill-opacity="0.7"/>' +
         '<text x="256" y="452" text-anchor="middle" dominant-baseline="central"' +
-        ' font-family="monospace" font-size="100" font-weight="600" fill="#172a35">' +
+        ' font-family="Fira Sans,sans-serif" font-size="100" font-weight="600" fill="#172a35">' +
         time + '</text></svg>');
 }
 
