@@ -3,7 +3,7 @@ version: "3.8"
 
 services:
   app:
-    image: ghcr.io/mahn-ke/forecast-by-vincent:latest@sha256:6717dd6c44dfeecb8ace555b3e0931cba2fb91211e56d3e702875becbb225bb1
+    image: ghcr.io/mahn-ke/forecast-by-vincent:latest@sha256:521328f6e4dda2b54bd119ef7a72220926dad123317bf9ecb56cf34fdffd3245
     restart: on-failure:5
     environment:
       - PORT=3000
