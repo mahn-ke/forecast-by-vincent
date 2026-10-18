@@ -17,7 +17,8 @@ export function createForecastCache(generateForecastVideo) {
                 y: location.y,
                 zoom: location.zoom === undefined ? 'provider-max' : location.zoom,
                 theme: location.theme || 'light',
-                label: location.label === 1 ? 1 : 0
+                label: location.label === 1 ? 1 : 0,
+                noFooter: location.noFooter === 1 ? 1 : 0
             });
             generation = generateForecastVideo(location).then(function (result) {
                 const nextBoundary = (Math.floor(generationStartedAt / FORECAST_INTERVAL_MS) + 1) *
@@ -61,7 +62,8 @@ export function createForecastCache(generateForecastVideo) {
     return async function getCachedForecastVideo(location) {
         const cacheKey = [location.x.toFixed(6), location.y.toFixed(6),
             location.zoom === undefined ? 'max' : String(location.zoom), location.theme || 'light',
-            location.label === 1 ? '1' : '0'].join(':');
+            location.label === 1 ? '1' : '0',
+            location.noFooter === 1 ? '1' : '0'].join(':');
         for (const [key, entry] of forecastCache) {
             if (Date.now() >= entry.staleUntil) forecastCache.delete(key);
         }
@@ -104,6 +106,7 @@ export function forecastResponseHeaders(result, stale) {
         'X-Forecast-Y': String(result.y),
         'X-Forecast-Theme': result.theme || 'light',
         'X-Forecast-Label': result.label === 1 ? '1' : '0',
+        'X-Forecast-No-Footer': result.noFooter === 1 ? '1' : '0',
         'X-Forecast-Frames': String(result.frames),
         'X-Forecast-Frame-Delay-Ms': String(result.frameDelayMs),
         'X-Forecast-Start': new Date(result.start * 1000).toISOString(),

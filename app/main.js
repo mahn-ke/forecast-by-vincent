@@ -676,7 +676,8 @@ async function generateForecastVideo(location) {
                 .png()
                 .toBuffer();
         }
-        const image = await sharp(centeredFrame)
+        // With noFooter the client draws the time box, so static rain yields identical frames.
+        const image = location.noFooter === 1 ? centeredFrame : await sharp(centeredFrame)
             .composite([{
                 input: buildTimeOverlaySvg(step.time,
                     steps.length > 1 ? frameIndex / (steps.length - 1) : 1)
@@ -706,6 +707,7 @@ async function generateForecastVideo(location) {
         y: location.y,
         theme: location.theme,
         label: location.label === 1 ? 1 : 0,
+        noFooter: location.noFooter === 1 ? 1 : 0,
         start: steps[0].time,
         end: steps[steps.length - 1].time,
         frames: steps.length
@@ -765,12 +767,14 @@ const server = http.createServer(async (req, res) => {
             const zoomParameter = requestUrl.searchParams.get('zoom');
             const themeParameter = requestUrl.searchParams.get('theme');
             const labelParameter = requestUrl.searchParams.get('label');
+            const noFooterParameter = requestUrl.searchParams.get('noFooter');
             const location = {
                 x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
                 y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
                 zoom: zoomParameter === null ? undefined : Number(zoomParameter),
                 theme: themeParameter === null ? 'light' : themeParameter,
-                label: labelParameter === '1' ? 1 : 0
+                label: labelParameter === '1' ? 1 : 0,
+                noFooter: noFooterParameter === '1' ? 1 : 0
             };
 
             if (!Number.isFinite(location.x) || location.x < -180 || location.x > 180 ||
@@ -791,6 +795,11 @@ const server = http.createServer(async (req, res) => {
             }
             if (labelParameter !== null && labelParameter !== '0' && labelParameter !== '1') {
                 const error = new RangeError('label must be 0 or 1');
+                error.statusCode = 400;
+                throw error;
+            }
+            if (noFooterParameter !== null && noFooterParameter !== '0' && noFooterParameter !== '1') {
+                const error = new RangeError('noFooter must be 0 or 1');
                 error.statusCode = 400;
                 throw error;
             }

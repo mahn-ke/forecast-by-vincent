@@ -121,4 +121,27 @@ test('forecast labels are opt-in in HTTP requests and rendered AV1 videos', asyn
     assert.ok(await meanDifference(0, 0, 100, 100) < 1, 'map away from the label must remain unchanged');
     assert.ok(await meanDifference(0, 452, 512, 60) < 1, 'time box must remain unchanged');
     assert.deepEqual((await request()).data, unlabeled.data);
+
+    for (const noFooter of ['', '2', 'true']) {
+        const invalid = await request('?noFooter=' + noFooter);
+        assert.equal(invalid.status, 400);
+        assert.equal(invalid.data, 'noFooter must be 0 or 1');
+    }
+    assert.deepEqual((await request('?noFooter=0')).data, unlabeled.data);
+    const footerless = await request('?noFooter=1');
+    assert.equal(footerless.status, 200);
+    assert.equal(footerless.headers['X-Forecast-No-Footer'], '1');
+    assert.equal(unlabeled.headers['X-Forecast-No-Footer'], '0');
+    assert.equal(footerless.headers['X-Forecast-Frames'], '91');
+    assert.equal(footerless.headers['X-Forecast-Start'], unlabeled.headers['X-Forecast-Start']);
+    // Without the moving progress bar and clock, a static map compresses to almost nothing.
+    assert.ok(footerless.data.length < unlabeled.data.length / 2,
+        footerless.data.length + ' bytes must be well below ' + unlabeled.data.length);
+    const footerlessFrame = await sharp(firstFrame('footerless', footerless.data))
+        .extract({ left: 0, top: 452, width: 512, height: 60 }).removeAlpha().raw().toBuffer();
+    const mapColour = await sharp(unlabeledFrame)
+        .extract({ left: 0, top: 200, width: 512, height: 60 }).removeAlpha().raw().toBuffer();
+    const footerDifference = footerlessFrame.reduce((sum, value, index) =>
+        sum + Math.abs(value - mapColour[index]), 0) / footerlessFrame.length;
+    assert.ok(footerDifference < 2, 'footer area must show the map, not the time box');
 });
