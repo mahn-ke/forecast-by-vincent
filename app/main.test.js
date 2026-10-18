@@ -105,4 +105,36 @@ test('forecast labels are opt-in in HTTP requests and rendered GIFs', async func
         sum + Math.abs(value - unlabeledTime[index]), 0) / labeledTime.length;
     assert.ok(meanTimeDifference < 1, 'time box must remain unchanged apart from GIF quantization');
     assert.deepEqual((await request()).data, unlabeled.data);
+
+    for (const av1 of ['', 'yes', '2']) {
+        const invalid = await request('?av1=' + av1);
+        assert.equal(invalid.status, 400);
+        assert.equal(invalid.data, 'av1 must be true or false');
+    }
+    assert.deepEqual((await request('?av1=false')).data, unlabeled.data);
+    const video = await request('?av1=true');
+    assert.equal(video.status, 200);
+    assert.equal(video.headers['Content-Type'], 'video/mp4');
+    assert.equal(video.headers['X-Forecast-Av1'], 'true');
+    assert.equal(video.headers['X-Forecast-Frame-Delay-Ms'], '100');
+    assert.equal(video.headers['Content-Length'], video.data.length);
+    assert.equal(video.data.subarray(4, 8).toString('ascii'), 'ftyp');
+    assert.notEqual(video.headers.ETag, unlabeled.headers.ETag);
+    assert.deepEqual((await request('?av1=1')).data, video.data);
+
+    const { execFileSync } = await import('node:child_process');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const directory = mkdtempSync(tmpdir() + '/forecast-av1-test-');
+    try {
+        writeFileSync(directory + '/forecast.mp4', video.data);
+        const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name,width,height,nb_read_frames,r_frame_rate', '-of', 'json',
+            directory + '/forecast.mp4']).toString()).streams[0];
+        assert.deepEqual(probe, {
+            codec_name: 'av1', width: 512, height: 512, r_frame_rate: '10/1', nb_read_frames: '91'
+        });
+    } finally {
+        rmSync(directory, { recursive: true, force: true });
+    }
 });

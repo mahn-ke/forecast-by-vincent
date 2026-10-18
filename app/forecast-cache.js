@@ -17,7 +17,8 @@ export function createForecastCache(generateForecastGif) {
                 y: location.y,
                 zoom: location.zoom === undefined ? 'provider-max' : location.zoom,
                 theme: location.theme || 'light',
-                label: location.label === 1 ? 1 : 0
+                label: location.label === 1 ? 1 : 0,
+                av1: location.av1 === 1
             });
             generation = generateForecastGif(location).then(function (result) {
                 const nextBoundary = (Math.floor(generationStartedAt / FORECAST_INTERVAL_MS) + 1) *
@@ -61,7 +62,7 @@ export function createForecastCache(generateForecastGif) {
     return async function getCachedForecastGif(location) {
         const cacheKey = [location.x.toFixed(6), location.y.toFixed(6),
             location.zoom === undefined ? 'max' : String(location.zoom), location.theme || 'light',
-            location.label === 1 ? '1' : '0'].join(':');
+            location.label === 1 ? '1' : '0', location.av1 === 1 ? 'av1' : 'gif'].join(':');
         for (const [key, entry] of forecastCache) {
             if (Date.now() >= entry.staleUntil) forecastCache.delete(key);
         }
@@ -92,7 +93,7 @@ export function createForecastCache(generateForecastGif) {
 export function forecastResponseHeaders(result, stale) {
     const maxAge = Math.max(0, Math.floor((result.expiresAt - Date.now()) / 1000));
     return {
-        'Content-Type': 'image/gif',
+        'Content-Type': result.contentType || 'image/gif',
         'Content-Length': result.data.length,
         'Cache-Control': 'public, max-age=' + maxAge + ', must-revalidate',
         'Expires': new Date(result.expiresAt).toUTCString(),
@@ -105,6 +106,8 @@ export function forecastResponseHeaders(result, stale) {
         'X-Forecast-Theme': result.theme || 'light',
         'X-Forecast-Label': result.label === 1 ? '1' : '0',
         'X-Forecast-Frames': String(result.frames),
+        'X-Forecast-Av1': result.av1 === 1 ? 'true' : 'false',
+        ...(result.frameDelayMs ? { 'X-Forecast-Frame-Delay-Ms': String(result.frameDelayMs) } : {}),
         'X-Forecast-Start': new Date(result.start * 1000).toISOString(),
         'X-Forecast-End': new Date(result.end * 1000).toISOString(),
         'X-Forecast-Cache-Until': new Date(result.staleUntil).toISOString(),

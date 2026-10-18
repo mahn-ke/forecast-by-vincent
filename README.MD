@@ -2,7 +2,9 @@
 
 Hosts the container serving [forecast.by.vincent.mahn.ke](https://forecast.by.vincent.mahn.ke).
 
-`GET /forecast?x=<longitude>&y=<latitude>&zoom=<2..100>&theme=<light|dark>&label=<0|1>` returns an animated GIF.
+`GET /forecast?x=<longitude>&y=<latitude>&zoom=<2..100>&theme=<light|dark>&label=<0|1>&av1=<true|false>` returns an
+animated GIF, or with `av1=true` an AV1 MP4 (`video/mp4`, 10 fps, roughly 1/20 of the GIF's size).
+`X-Forecast-Frames` and `X-Forecast-Frame-Delay-Ms` describe the animation in both formats.
 It has one frame per minute for the next 90 minutes. Rain between WetterOnline's 5- and 15-minute forecast
 images is morphed rather than cross-faded: each colour band is moved along optical flow and its outline is
 interpolated, so cells drift, grow, and shrink without fading.
@@ -11,7 +13,7 @@ Use `label=1` to show place names such as Hamburg. The map, rain forecast, and t
 remain visible in either mode. `theme` defaults to `light`. With `theme=dark`, the WetterOnline map and
 rain imagery are colour-inverted, while city labels and the time box stay unchanged.
 
-Forecast GIFs are cached per location, zoom, theme, and label setting until the next five-minute clock
+Forecasts are cached per location, zoom, theme, label, and format until the next five-minute clock
 boundary. During the following 60 seconds, the previous GIF may be served while
 a refresh runs. At :01, :06, :11, etc. the previous interval's GIF is no longer
 eligible: requests wait for regeneration, and failures return HTTP 502 instead

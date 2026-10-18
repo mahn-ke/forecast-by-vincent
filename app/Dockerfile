@@ -3,7 +3,7 @@ FROM node:26-alpine
 WORKDIR /app
 COPY ./ /app
 
-RUN apk add --no-cache curl fontconfig \
+RUN apk add --no-cache curl fontconfig ffmpeg \
     && mkdir -p /usr/local/share/fonts/fira-sans \
     && cp /app/fonts/*.ttf /usr/local/share/fonts/fira-sans/ \
     && fc-cache -f \

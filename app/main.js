@@ -1,4 +1,8 @@
+import { spawn } from 'child_process';
+import { mkdtemp, readFile, rm } from 'fs/promises';
 import http from 'http';
+import { tmpdir } from 'os';
+import path from 'path';
 import { createForecastCache, forecastResponseHeaders } from './forecast-cache.js';
 import cvModule from '@techstark/opencv-js';
 import sharp from 'sharp';
@@ -685,7 +689,7 @@ async function generateForecastGif(location) {
             ((Date.now() - renderStartedAt) / 1000).toFixed(1) + 's');
         return image;
     });
-    const gif = await sharp(images, {
+    const data = location.av1 === 1 ? await encodeAv1Video(images) : await sharp(images, {
         join: { animated: true, across: 1, background: '#fff' }
     }).gif({
         loop: 0,
@@ -693,15 +697,18 @@ async function generateForecastGif(location) {
         keepDuplicateFrames: true,
         effort: 5
     }).toBuffer();
-    console.info('[forecast] GIF encoded', {
+    console.info('[forecast] ' + (location.av1 === 1 ? 'AV1' : 'GIF') + ' encoded', {
         frames: steps.length,
-        bytes: gif.length,
+        bytes: data.length,
         renderSeconds: ((Date.now() - renderStartedAt) / 1000).toFixed(1),
         encodeSeconds: ((Date.now() - outputStartedAt) / 1000).toFixed(1)
     });
 
     return {
-        data: gif,
+        data: data,
+        contentType: location.av1 === 1 ? 'video/mp4' : 'image/gif',
+        av1: location.av1 === 1 ? 1 : 0,
+        frameDelayMs: FORECAST_FRAME_DELAY_MS,
         zoom: zoom,
         sourceZoom: sourceZoom,
         x: location.x,
@@ -712,6 +719,36 @@ async function generateForecastGif(location) {
         end: steps[steps.length - 1].time,
         frames: steps.length
     };
+}
+
+// CRF 48 keeps map lines and rain edges crisp at roughly 1/20 of the GIF size.
+async function encodeAv1Video(pngFrames) {
+    const directory = await mkdtemp(path.join(tmpdir(), 'forecast-av1-'));
+    const output = path.join(directory, 'forecast.mp4');
+    try {
+        await new Promise(function (resolve, reject) {
+            const ffmpeg = spawn('ffmpeg', [
+                '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'image2pipe', '-framerate', String(1000 / FORECAST_FRAME_DELAY_MS), '-c:v', 'png', '-i', '-',
+                '-c:v', 'libsvtav1', '-preset', '6', '-crf', '48', '-pix_fmt', 'yuv420p',
+                '-svtav1-params', 'lp=2',
+                '-movflags', '+faststart', output
+            ], { stdio: ['pipe', 'ignore', 'pipe'] });
+            let stderr = '';
+            ffmpeg.stderr.on('data', function (chunk) { stderr += chunk; });
+            ffmpeg.on('error', reject);
+            ffmpeg.on('close', function (code) {
+                if (code === 0) resolve();
+                else reject(new Error('ffmpeg exited with ' + code + ': ' + stderr.trim()));
+            });
+            ffmpeg.stdin.on('error', reject);
+            for (const frame of pngFrames) ffmpeg.stdin.write(frame);
+            ffmpeg.stdin.end();
+        });
+        return await readFile(output);
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
 }
 
 const getCachedForecastGif = createForecastCache(generateForecastGif);
@@ -737,7 +774,9 @@ const server = http.createServer(async (req, res) => {
             const zoomParameter = requestUrl.searchParams.get('zoom');
             const themeParameter = requestUrl.searchParams.get('theme');
             const labelParameter = requestUrl.searchParams.get('label');
+            const av1Parameter = requestUrl.searchParams.get('av1');
             const location = {
+                av1: av1Parameter === 'true' || av1Parameter === '1' ? 1 : 0,
                 x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
                 y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
                 zoom: zoomParameter === null ? undefined : Number(zoomParameter),
@@ -763,6 +802,11 @@ const server = http.createServer(async (req, res) => {
             }
             if (labelParameter !== null && labelParameter !== '0' && labelParameter !== '1') {
                 const error = new RangeError('label must be 0 or 1');
+                error.statusCode = 400;
+                throw error;
+            }
+            if (av1Parameter !== null && !['true', 'false', '1', '0'].includes(av1Parameter)) {
+                const error = new RangeError('av1 must be true or false');
                 error.statusCode = 400;
                 throw error;
             }
