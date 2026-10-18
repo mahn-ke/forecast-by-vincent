@@ -23,7 +23,7 @@ function forecast(id = 'new') {
     };
 }
 
-test('fresh requests reuse the GIF until the next five-minute boundary', async function (t) {
+test('fresh requests reuse the video until the next five-minute boundary', async function (t) {
     setup(t, '2026-10-18T13:00:30Z');
     const generate = t.mock.fn(async () => forecast());
     const get = createForecastCache(generate);
@@ -35,7 +35,7 @@ test('fresh requests reuse the GIF until the next five-minute boundary', async f
     assert.equal(generate.mock.callCount(), 1);
 });
 
-test('a 17:00 request waits for regeneration instead of returning the 13:00 GIF', async function (t) {
+test('a 17:00 request waits for regeneration instead of returning the 13:00 video', async function (t) {
     setup(t);
     const pending = Promise.withResolvers();
     const generate = t.mock.fn(async () => forecast('13:00'));

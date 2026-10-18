@@ -474,7 +474,7 @@ async function renderHamburgFrame(frame, geo, zoom, center, geoTileCache, layerM
     return cropped;
 }
 
-async function generateForecastGif(location) {
+async function generateForecastVideo(location) {
     const renderStartedAt = Date.now();
     console.info('[forecast] render started', {
         x: location.x,
@@ -689,15 +689,8 @@ async function generateForecastGif(location) {
             ((Date.now() - renderStartedAt) / 1000).toFixed(1) + 's');
         return image;
     });
-    const data = location.av1 === 1 ? await encodeAv1Video(images) : await sharp(images, {
-        join: { animated: true, across: 1, background: '#fff' }
-    }).gif({
-        loop: 0,
-        delay: images.map(function () { return FORECAST_FRAME_DELAY_MS; }),
-        keepDuplicateFrames: true,
-        effort: 5
-    }).toBuffer();
-    console.info('[forecast] ' + (location.av1 === 1 ? 'AV1' : 'GIF') + ' encoded', {
+    const data = await encodeAv1Video(images);
+    console.info('[forecast] AV1 encoded', {
         frames: steps.length,
         bytes: data.length,
         renderSeconds: ((Date.now() - renderStartedAt) / 1000).toFixed(1),
@@ -706,8 +699,6 @@ async function generateForecastGif(location) {
 
     return {
         data: data,
-        contentType: location.av1 === 1 ? 'video/mp4' : 'image/gif',
-        av1: location.av1 === 1 ? 1 : 0,
         frameDelayMs: FORECAST_FRAME_DELAY_MS,
         zoom: zoom,
         sourceZoom: sourceZoom,
@@ -721,7 +712,7 @@ async function generateForecastGif(location) {
     };
 }
 
-// CRF 48 keeps map lines and rain edges crisp at roughly 1/20 of the GIF size.
+// CRF 48 keeps map lines and rain edges crisp at roughly 1/20 of an equivalent GIF's size.
 async function encodeAv1Video(pngFrames) {
     const directory = await mkdtemp(path.join(tmpdir(), 'forecast-av1-'));
     const output = path.join(directory, 'forecast.mp4');
@@ -751,7 +742,7 @@ async function encodeAv1Video(pngFrames) {
     }
 }
 
-const getCachedForecastGif = createForecastCache(generateForecastGif);
+const getCachedForecastVideo = createForecastCache(generateForecastVideo);
 
 const server = http.createServer(async (req, res) => {
     if (req.url === '/healthz') {
@@ -774,9 +765,7 @@ const server = http.createServer(async (req, res) => {
             const zoomParameter = requestUrl.searchParams.get('zoom');
             const themeParameter = requestUrl.searchParams.get('theme');
             const labelParameter = requestUrl.searchParams.get('label');
-            const av1Parameter = requestUrl.searchParams.get('av1');
             const location = {
-                av1: av1Parameter === 'true' || av1Parameter === '1' ? 1 : 0,
                 x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
                 y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
                 zoom: zoomParameter === null ? undefined : Number(zoomParameter),
@@ -805,13 +794,8 @@ const server = http.createServer(async (req, res) => {
                 error.statusCode = 400;
                 throw error;
             }
-            if (av1Parameter !== null && !['true', 'false', '1', '0'].includes(av1Parameter)) {
-                const error = new RangeError('av1 must be true or false');
-                error.statusCode = 400;
-                throw error;
-            }
 
-            const cached = await getCachedForecastGif(location);
+            const cached = await getCachedForecastVideo(location);
             const result = cached.result;
             const headers = forecastResponseHeaders(result, cached.stale);
             if (req.headers['if-none-match'] === result.etag) {
@@ -822,12 +806,12 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(200, headers);
             res.end(result.data);
         } catch (error) {
-            console.error('Forecast GIF generation failed:', error);
+            console.error('Forecast generation failed:', error);
             res.writeHead(error.statusCode || 502, {
                 'Content-Type': 'text/plain; charset=utf-8',
                 'Cache-Control': 'no-store'
             });
-            res.end(error.statusCode ? error.message : 'WetterOnline forecast GIF generation failed');
+            res.end(error.statusCode ? error.message : 'WetterOnline forecast generation failed');
         }
         return;
     }
@@ -841,7 +825,7 @@ server.listen(PORT, () => {
     const defaultLocation = { x: HAMBURG.longitude, y: HAMBURG.latitude };
     const warmupStartedAt = Date.now();
     console.info('[forecast] startup warm-up started', defaultLocation);
-    getCachedForecastGif(defaultLocation)
+    getCachedForecastVideo(defaultLocation)
         .then(function ({ result }) {
             console.info('[forecast] startup warm-up ready', {
                 frames: result.frames,

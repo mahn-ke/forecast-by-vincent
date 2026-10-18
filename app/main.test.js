@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { test } from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import sharp from 'sharp';
 
-test('forecast labels are opt-in in HTTP requests and rendered GIFs', async function (t) {
+test('forecast labels are opt-in in HTTP requests and rendered AV1 videos', async function (t) {
     t.mock.method(console, 'info', function () {});
     t.mock.method(console, 'error', function () {});
     let handler;
@@ -81,60 +84,41 @@ test('forecast labels are opt-in in HTTP requests and rendered GIFs', async func
     assert.equal(labeled.status, 200);
     assert.equal(labeled.headers['X-Forecast-Label'], '1');
     assert.equal(fetchMock.mock.calls.filter(call => String(call.arguments[0]).includes('/cities/')).length, 1);
-    const metadata = await sharp(labeled.data, { animated: true }).metadata();
-    assert.equal(metadata.width, 512);
-    assert.equal(metadata.pageHeight, 512);
-    assert.equal(metadata.pages, 91);
-    assert.ok(metadata.delay.every(delay => delay === 100));
 
-    async function region(data, left, top, width, height) {
-        return sharp(data).extract({ left, top, width, height }).ensureAlpha().raw().toBuffer();
-    }
-    assert.notDeepEqual(
-        await region(labeled.data, 200, 240, 112, 32),
-        await region(unlabeled.data, 200, 240, 112, 32)
-    );
-    assert.deepEqual(
-        await region(labeled.data, 0, 0, 100, 100),
-        await region(unlabeled.data, 0, 0, 100, 100)
-    );
-    const labeledTime = await region(labeled.data, 0, 452, 512, 60);
-    const unlabeledTime = await region(unlabeled.data, 0, 452, 512, 60);
-    // The additional text changes GIF palette quantization slightly.
-    const meanTimeDifference = labeledTime.reduce((sum, value, index) =>
-        sum + Math.abs(value - unlabeledTime[index]), 0) / labeledTime.length;
-    assert.ok(meanTimeDifference < 1, 'time box must remain unchanged apart from GIF quantization');
-    assert.deepEqual((await request()).data, unlabeled.data);
+    assert.equal(unlabeled.headers['Content-Type'], 'video/mp4');
+    assert.equal(unlabeled.headers['X-Forecast-Frames'], '91');
+    assert.equal(unlabeled.headers['X-Forecast-Frame-Delay-Ms'], '100');
+    assert.equal(unlabeled.headers['Content-Length'], unlabeled.data.length);
+    assert.equal(unlabeled.data.subarray(4, 8).toString('ascii'), 'ftyp');
+    // The av1 parameter from older clients is ignored.
+    assert.deepEqual((await request('?av1=true')).data, unlabeled.data);
 
-    for (const av1 of ['', 'yes', '2']) {
-        const invalid = await request('?av1=' + av1);
-        assert.equal(invalid.status, 400);
-        assert.equal(invalid.data, 'av1 must be true or false');
-    }
-    assert.deepEqual((await request('?av1=false')).data, unlabeled.data);
-    const video = await request('?av1=true');
-    assert.equal(video.status, 200);
-    assert.equal(video.headers['Content-Type'], 'video/mp4');
-    assert.equal(video.headers['X-Forecast-Av1'], 'true');
-    assert.equal(video.headers['X-Forecast-Frame-Delay-Ms'], '100');
-    assert.equal(video.headers['Content-Length'], video.data.length);
-    assert.equal(video.data.subarray(4, 8).toString('ascii'), 'ftyp');
-    assert.notEqual(video.headers.ETag, unlabeled.headers.ETag);
-    assert.deepEqual((await request('?av1=1')).data, video.data);
-
-    const { execFileSync } = await import('node:child_process');
-    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
     const directory = mkdtempSync(tmpdir() + '/forecast-av1-test-');
-    try {
-        writeFileSync(directory + '/forecast.mp4', video.data);
-        const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0',
-            '-show_entries', 'stream=codec_name,width,height,nb_read_frames,r_frame_rate', '-of', 'json',
-            directory + '/forecast.mp4']).toString()).streams[0];
-        assert.deepEqual(probe, {
-            codec_name: 'av1', width: 512, height: 512, r_frame_rate: '10/1', nb_read_frames: '91'
-        });
-    } finally {
-        rmSync(directory, { recursive: true, force: true });
+    t.after(function () { rmSync(directory, { recursive: true, force: true }); });
+    function firstFrame(name, data) {
+        writeFileSync(directory + '/' + name + '.mp4', data);
+        execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', directory + '/' + name + '.mp4',
+            '-frames:v', '1', directory + '/' + name + '.png']);
+        return directory + '/' + name + '.png';
     }
+    const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_name,width,height,nb_read_frames,r_frame_rate', '-of', 'json',
+        '-i', 'pipe:0'], { input: unlabeled.data }).toString()).streams[0];
+    assert.deepEqual(probe, {
+        codec_name: 'av1', width: 512, height: 512, r_frame_rate: '10/1', nb_read_frames: '91'
+    });
+
+    const labeledFrame = firstFrame('labeled', labeled.data);
+    const unlabeledFrame = firstFrame('unlabeled', unlabeled.data);
+    async function meanDifference(left, top, width, height) {
+        const region = file => sharp(file).extract({ left, top, width, height }).removeAlpha().raw().toBuffer();
+        const a = await region(labeledFrame);
+        const b = await region(unlabeledFrame);
+        return a.reduce((sum, value, index) => sum + Math.abs(value - b[index]), 0) / a.length;
+    }
+    // AV1 is lossy, so unchanged regions are compared with a small tolerance.
+    assert.ok(await meanDifference(200, 240, 112, 32) > 5, 'label must be drawn');
+    assert.ok(await meanDifference(0, 0, 100, 100) < 1, 'map away from the label must remain unchanged');
+    assert.ok(await meanDifference(0, 452, 512, 60) < 1, 'time box must remain unchanged');
+    assert.deepEqual((await request()).data, unlabeled.data);
 });
