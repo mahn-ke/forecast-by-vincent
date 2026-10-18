@@ -8,6 +8,7 @@ const FORECAST_STEP_SECONDS = 5 * 60;
 const FORECAST_HORIZON_SECONDS = 90 * 60;
 const FORECAST_FRAME_DELAY_MS = 500;
 const MAX_FORECAST_ZOOM = 100;
+const FORECAST_THEMES = ['light', 'dark'];
 const HAMBURG = { latitude: 53.55, longitude: 9.99 };
 
 function parseForecastFrameTime(id) {
@@ -71,9 +72,9 @@ function buildTimeOverlaySvg(timestamp) {
         timeZone: 'Europe/Berlin'
     }).format(new Date(timestamp * 1000));
     return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' +
-        '<rect x="0" y="392" width="512" height="120" fill="#fff" fill-opacity="0.7"/>' +
-        '<text x="256" y="452" text-anchor="middle" dominant-baseline="central"' +
-        ' font-family="Fira Sans,sans-serif" font-size="100" font-weight="600" fill="#172a35">' +
+        '<rect x="0" y="452" width="512" height="60" fill="#fff" fill-opacity="0.7"/>' +
+        '<text x="256" y="482" text-anchor="middle" dominant-baseline="central"' +
+        ' font-family="Fira Sans,sans-serif" font-size="50" font-weight="600" fill="#172a35">' +
         time + '</text></svg>');
 }
 
@@ -341,7 +342,8 @@ async function generateForecastGif(location) {
     console.info('[forecast] render started', {
         x: location.x,
         y: location.y,
-        zoom: location.zoom === undefined ? 'provider-max' : location.zoom
+        zoom: location.zoom === undefined ? 'provider-max' : location.zoom,
+        theme: location.theme
     });
     const metadataUrls = [
         'https://tiles.wo-cloud.com/metadata?type=geo',
@@ -494,10 +496,12 @@ async function generateForecastGif(location) {
             }).png().toBuffer();
         }
 
-        const mapFrame = await sharp(baseImage).composite([
-            { input: rainImage },
-            { input: cityOverlay }
-        ]).png().toBuffer();
+        let mapFrame = await sharp(baseImage).composite([{ input: rainImage }]).png().toBuffer();
+        // Dark theme inverts only the WetterOnline imagery; city labels and the time box stay as-is.
+        if (location.theme === 'dark') {
+            mapFrame = await sharp(mapFrame).negate({ alpha: false }).png().toBuffer();
+        }
+        mapFrame = await sharp(mapFrame).composite([{ input: cityOverlay }]).png().toBuffer();
         let centeredFrame = mapFrame;
         if (overzoomScale > 1) {
             const cropSize = Math.max(1, Math.round(512 / overzoomScale));
@@ -539,6 +543,7 @@ async function generateForecastGif(location) {
         sourceZoom: sourceZoom,
         x: location.x,
         y: location.y,
+        theme: location.theme,
         start: steps[0].time,
         end: steps[steps.length - 1].time,
         frames: steps.length
@@ -566,10 +571,12 @@ const server = http.createServer(async (req, res) => {
             const xParameter = requestUrl.searchParams.get('x');
             const yParameter = requestUrl.searchParams.get('y');
             const zoomParameter = requestUrl.searchParams.get('zoom');
+            const themeParameter = requestUrl.searchParams.get('theme');
             const location = {
                 x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
                 y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
-                zoom: zoomParameter === null ? undefined : Number(zoomParameter)
+                zoom: zoomParameter === null ? undefined : Number(zoomParameter),
+                theme: themeParameter === null ? 'light' : themeParameter
             };
 
             if (!Number.isFinite(location.x) || location.x < -180 || location.x > 180 ||
@@ -580,6 +587,11 @@ const server = http.createServer(async (req, res) => {
             }
             if (zoomParameter !== null && (!Number.isInteger(location.zoom) || location.zoom < 0 || location.zoom > MAX_FORECAST_ZOOM)) {
                 const error = new RangeError('zoom must be an integer between 0 and ' + MAX_FORECAST_ZOOM);
+                error.statusCode = 400;
+                throw error;
+            }
+            if (!FORECAST_THEMES.includes(location.theme)) {
+                const error = new RangeError('theme must be one of: ' + FORECAST_THEMES.join(', '));
                 error.statusCode = 400;
                 throw error;
             }

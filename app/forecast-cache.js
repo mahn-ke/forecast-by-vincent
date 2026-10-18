@@ -15,7 +15,8 @@ export function createForecastCache(generateForecastGif) {
             console.info('[forecast] generation started', {
                 x: location.x,
                 y: location.y,
-                zoom: location.zoom === undefined ? 'provider-max' : location.zoom
+                zoom: location.zoom === undefined ? 'provider-max' : location.zoom,
+                theme: location.theme || 'light'
             });
             generation = generateForecastGif(location).then(function (result) {
                 const nextBoundary = (Math.floor(generationStartedAt / FORECAST_INTERVAL_MS) + 1) *
@@ -58,7 +59,7 @@ export function createForecastCache(generateForecastGif) {
 
     return async function getCachedForecastGif(location) {
         const cacheKey = [location.x.toFixed(6), location.y.toFixed(6),
-            location.zoom === undefined ? 'max' : String(location.zoom)].join(':');
+            location.zoom === undefined ? 'max' : String(location.zoom), location.theme || 'light'].join(':');
         for (const [key, entry] of forecastCache) {
             if (Date.now() >= entry.staleUntil) forecastCache.delete(key);
         }
@@ -99,6 +100,7 @@ export function forecastResponseHeaders(result, stale) {
         'X-Forecast-Source-Zoom': String(result.sourceZoom),
         'X-Forecast-X': String(result.x),
         'X-Forecast-Y': String(result.y),
+        'X-Forecast-Theme': result.theme || 'light',
         'X-Forecast-Frames': String(result.frames),
         'X-Forecast-Start': new Date(result.start * 1000).toISOString(),
         'X-Forecast-End': new Date(result.end * 1000).toISOString(),

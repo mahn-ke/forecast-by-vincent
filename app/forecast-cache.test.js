@@ -172,6 +172,18 @@ test('cache keys separate locations and explicit zooms', async function (t) {
     assert.equal(generate.mock.callCount(), 3);
 });
 
+test('cache keys separate themes and treat a missing theme as light', async function (t) {
+    setup(t);
+    const generate = t.mock.fn(async (requested) => ({ ...forecast(), theme: requested.theme }));
+    const get = createForecastCache(generate);
+    await get(location);
+    await get({ ...location, theme: 'light' });
+    const dark = await get({ ...location, theme: 'dark' });
+    await get({ ...location, theme: 'dark' });
+    assert.equal(generate.mock.callCount(), 2);
+    assert.equal(forecastResponseHeaders(dark.result, dark.stale)['X-Forecast-Theme'], 'dark');
+});
+
 test('the eight-entry LRU cache retains recently accessed locations', async function (t) {
     setup(t);
     const generate = t.mock.fn(async () => forecast());
