@@ -348,9 +348,11 @@ async function generateForecastGif(location) {
     const metadataUrls = [
         'https://tiles.wo-cloud.com/metadata?type=geo',
         'https://tiles.wo-cloud.com/metadata?lg=wr&period=periodCurrentHighRes&type=period',
-        'https://tiles.wo-cloud.com/metadata?lg=wr&period=periodCurrentLowRes&type=period',
-        'https://radar.wo-cloud.com/cities/v29/cities/de.json'
+        'https://tiles.wo-cloud.com/metadata?lg=wr&period=periodCurrentLowRes&type=period'
     ];
+    if (location.label === 1) {
+        metadataUrls.push('https://radar.wo-cloud.com/cities/v29/cities/de.json');
+    }
     const metadataResponses = await Promise.all(metadataUrls.map(function (url) {
         return fetch(url, { signal: AbortSignal.timeout(20000) });
     }));
@@ -432,7 +434,7 @@ async function generateForecastGif(location) {
     });
     const uniqueFrames = Array.from(sourceFrames.values());
     const center = projectMercator(location.y, location.x, sourceZoom);
-    const cityOverlay = buildCityOverlaySvg(cities, sourceZoom, center);
+    const cityOverlay = location.label === 1 ? buildCityOverlaySvg(cities, sourceZoom, center) : null;
     const geoTileCache = new Map();
     let nativeFramesCompleted = 0;
     const nativeFrameStartedAt = Date.now();
@@ -501,7 +503,9 @@ async function generateForecastGif(location) {
         if (location.theme === 'dark') {
             mapFrame = await sharp(mapFrame).negate({ alpha: false }).png().toBuffer();
         }
-        mapFrame = await sharp(mapFrame).composite([{ input: cityOverlay }]).png().toBuffer();
+        if (cityOverlay) {
+            mapFrame = await sharp(mapFrame).composite([{ input: cityOverlay }]).png().toBuffer();
+        }
         let centeredFrame = mapFrame;
         if (overzoomScale > 1) {
             const cropSize = Math.max(1, Math.round(512 / overzoomScale));
@@ -544,6 +548,7 @@ async function generateForecastGif(location) {
         x: location.x,
         y: location.y,
         theme: location.theme,
+        label: location.label === 1 ? 1 : 0,
         start: steps[0].time,
         end: steps[steps.length - 1].time,
         frames: steps.length
@@ -572,11 +577,13 @@ const server = http.createServer(async (req, res) => {
             const yParameter = requestUrl.searchParams.get('y');
             const zoomParameter = requestUrl.searchParams.get('zoom');
             const themeParameter = requestUrl.searchParams.get('theme');
+            const labelParameter = requestUrl.searchParams.get('label');
             const location = {
                 x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
                 y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
                 zoom: zoomParameter === null ? undefined : Number(zoomParameter),
-                theme: themeParameter === null ? 'light' : themeParameter
+                theme: themeParameter === null ? 'light' : themeParameter,
+                label: labelParameter === '1' ? 1 : 0
             };
 
             if (!Number.isFinite(location.x) || location.x < -180 || location.x > 180 ||
@@ -592,6 +599,11 @@ const server = http.createServer(async (req, res) => {
             }
             if (!FORECAST_THEMES.includes(location.theme)) {
                 const error = new RangeError('theme must be one of: ' + FORECAST_THEMES.join(', '));
+                error.statusCode = 400;
+                throw error;
+            }
+            if (labelParameter !== null && labelParameter !== '0' && labelParameter !== '1') {
+                const error = new RangeError('label must be 0 or 1');
                 error.statusCode = 400;
                 throw error;
             }

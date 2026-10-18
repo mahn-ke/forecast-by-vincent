@@ -197,6 +197,35 @@ test('the eight-entry LRU cache retains recently accessed locations', async func
     assert.equal(generate.mock.callCount(), 10);
 });
 
+test('cache keys separate labels and treat a missing label as disabled', async function (t) {
+    setup(t);
+    const generate = t.mock.fn(async (requested) => ({ ...forecast(), label: requested.label }));
+    const get = createForecastCache(generate);
+    const defaultResponse = await get(location);
+    assert.deepEqual(await get({ ...location, label: 0 }), defaultResponse);
+    const labeled = await get({ ...location, label: 1 });
+    assert.deepEqual(await get({ ...location, label: 1 }), labeled);
+    assert.equal(generate.mock.callCount(), 2);
+    assert.equal(forecastResponseHeaders(defaultResponse.result, false)['X-Forecast-Label'], '0');
+    assert.equal(forecastResponseHeaders(labeled.result, false)['X-Forecast-Label'], '1');
+});
+
+test('concurrent generations are shared only within the same label setting', async function (t) {
+    setup(t);
+    const pending = Promise.withResolvers();
+    const generate = t.mock.fn(async (requested) => {
+        await pending.promise;
+        return { ...forecast(), label: requested.label };
+    });
+    const get = createForecastCache(generate);
+    const responses = [get(location), get({ ...location, label: 0 }), get({ ...location, label: 1 })];
+    assert.equal(generate.mock.callCount(), 2);
+    pending.resolve();
+    const [defaultResponse, disabled, enabled] = await Promise.all(responses);
+    assert.deepEqual(defaultResponse, disabled);
+    assert.notStrictEqual(defaultResponse.result, enabled.result);
+});
+
 test('HTTP headers enforce revalidation without an additional stale window', async function (t) {
     setup(t, '2026-10-18T13:00:30Z');
     const get = createForecastCache(async () => forecast());
