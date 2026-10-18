@@ -1,5 +1,5 @@
 import http from 'http';
-import { createHash } from 'node:crypto';
+import { createForecastCache, forecastResponseHeaders } from './forecast-cache.js';
 import cvModule from '@techstark/opencv-js';
 import sharp from 'sharp';
 
@@ -7,7 +7,6 @@ const PORT = Number(process.env.PORT || 3000);
 const FORECAST_STEP_SECONDS = 5 * 60;
 const FORECAST_HORIZON_SECONDS = 90 * 60;
 const FORECAST_FRAME_DELAY_MS = 500;
-const FORECAST_CACHE_GRACE_MS = 30000;
 const MAX_FORECAST_ZOOM = 100;
 const HAMBURG = { latitude: 53.55, longitude: 9.99 };
 
@@ -546,90 +545,7 @@ async function generateForecastGif(location) {
     };
 }
 
-const FORECAST_CACHE_MAX_ENTRIES = 8;
-const forecastCache = new Map();
-const forecastGeneration = new Map();
-
-function getCachedForecastGif(location) {
-    const cacheKey = [location.x.toFixed(6), location.y.toFixed(6),
-        location.zoom === undefined ? 'max' : String(location.zoom)].join(':');
-    const cached = forecastCache.get(cacheKey);
-    if (cached && Date.now() < cached.expiresAt) {
-        forecastCache.delete(cacheKey);
-        forecastCache.set(cacheKey, cached);
-        return Promise.resolve({ result: cached, stale: false });
-    }
-    if (cached) {
-        startForecastGeneration(location, cacheKey).catch(function (error) {
-            console.error('[forecast] background refresh failed:', error);
-        });
-        return Promise.resolve({ result: cached, stale: true });
-    }
-
-    return startForecastGeneration(location, cacheKey).then(function (result) {
-        return { result: result, stale: false };
-    });
-}
-
-function startForecastGeneration(location, cacheKey) {
-    let generation = forecastGeneration.get(cacheKey);
-    if (!generation) {
-        const generationStartedAt = Date.now();
-        console.info('[forecast] generation started', {
-            x: location.x,
-            y: location.y,
-            zoom: location.zoom === undefined ? 'provider-max' : location.zoom
-        });
-        generation = generateForecastGif(location).then(function (result) {
-            const intervalMilliseconds = FORECAST_STEP_SECONDS * 1000;
-            const nextBoundary = (Math.floor(result.start * 1000 / intervalMilliseconds) + 1) * intervalMilliseconds;
-            const entry = {
-                ...result,
-                expiresAt: nextBoundary + FORECAST_CACHE_GRACE_MS,
-                etag: '"' + createHash('sha256').update(result.data).digest('hex') + '"'
-            };
-            forecastCache.set(cacheKey, entry);
-            while (forecastCache.size > FORECAST_CACHE_MAX_ENTRIES) {
-                forecastCache.delete(forecastCache.keys().next().value);
-            }
-            console.info('[forecast] cache refreshed', {
-                x: result.x,
-                y: result.y,
-                zoom: result.zoom,
-                frames: result.frames,
-                cacheUntil: new Date(entry.expiresAt).toISOString(),
-                renderSeconds: ((Date.now() - generationStartedAt) / 1000).toFixed(1)
-            });
-            return entry;
-        }).finally(function () {
-            forecastGeneration.delete(cacheKey);
-        });
-        forecastGeneration.set(cacheKey, generation);
-    }
-    return generation;
-}
-
-function forecastResponseHeaders(result, stale) {
-    const maxAge = Math.max(0, Math.floor((result.expiresAt - Date.now()) / 1000));
-    return {
-        'Content-Type': 'image/gif',
-        'Content-Length': result.data.length,
-        'Cache-Control': stale ? 'public, max-age=0, stale-while-revalidate=300' :
-            'public, max-age=' + maxAge + ', must-revalidate',
-        'Expires': new Date(result.expiresAt).toUTCString(),
-        'ETag': result.etag,
-        'X-Forecast-Stale': String(stale),
-        'X-Forecast-Zoom': String(result.zoom),
-        'X-Forecast-Source-Zoom': String(result.sourceZoom),
-        'X-Forecast-X': String(result.x),
-        'X-Forecast-Y': String(result.y),
-        'X-Forecast-Frames': String(result.frames),
-        'X-Forecast-Start': new Date(result.start * 1000).toISOString(),
-        'X-Forecast-End': new Date(result.end * 1000).toISOString(),
-        'X-Forecast-Cache-Until': new Date(result.expiresAt).toISOString(),
-        'X-Forecast-Source': 'WetterOnline RegenRadar'
-    };
-}
+const getCachedForecastGif = createForecastCache(generateForecastGif);
 
 const server = http.createServer(async (req, res) => {
     if (req.url === '/healthz') {
@@ -696,11 +612,10 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
     const defaultLocation = { x: HAMBURG.longitude, y: HAMBURG.latitude };
-    const defaultCacheKey = [defaultLocation.x.toFixed(6), defaultLocation.y.toFixed(6), 'max'].join(':');
     const warmupStartedAt = Date.now();
     console.info('[forecast] startup warm-up started', defaultLocation);
-    startForecastGeneration(defaultLocation, defaultCacheKey)
-        .then(function (result) {
+    getCachedForecastGif(defaultLocation)
+        .then(function ({ result }) {
             console.info('[forecast] startup warm-up ready', {
                 frames: result.frames,
                 zoom: result.zoom,

@@ -1,7 +1,8 @@
 {
     "name": "forecast-by-vincent",
     "scripts": {
-        "start": "node main.js"
+        "start": "node main.js",
+        "test": "node --test"
     },
     "dependencies": {
         "@techstark/opencv-js": "^5.0.0-release.1",
