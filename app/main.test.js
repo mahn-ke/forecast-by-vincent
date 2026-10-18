@@ -84,7 +84,8 @@ test('forecast labels are opt-in in HTTP requests and rendered GIFs', async func
     const metadata = await sharp(labeled.data, { animated: true }).metadata();
     assert.equal(metadata.width, 512);
     assert.equal(metadata.pageHeight, 512);
-    assert.equal(metadata.pages, 19);
+    assert.equal(metadata.pages, 91);
+    assert.ok(metadata.delay.every(delay => delay === 100));
 
     async function region(data, left, top, width, height) {
         return sharp(data).extract({ left, top, width, height }).ensureAlpha().raw().toBuffer();

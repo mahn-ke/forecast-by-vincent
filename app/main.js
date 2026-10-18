@@ -5,8 +5,9 @@ import sharp from 'sharp';
 
 const PORT = Number(process.env.PORT || 3000);
 const FORECAST_STEP_SECONDS = 5 * 60;
+const FORECAST_FRAME_SECONDS = 60;
 const FORECAST_HORIZON_SECONDS = 90 * 60;
-const FORECAST_FRAME_DELAY_MS = 500;
+const FORECAST_FRAME_DELAY_MS = 500 * FORECAST_FRAME_SECONDS / FORECAST_STEP_SECONDS;
 const MAX_FORECAST_ZOOM = 100;
 const FORECAST_THEMES = ['light', 'dark'];
 const HAMBURG = { latitude: 53.55, longitude: 9.99 };
@@ -405,9 +406,9 @@ async function generateForecastGif(location) {
     const futureFrames = availableFrames.filter(function (frame) { return frame.time > now; });
     if (!futureFrames.length) throw new Error('WetterOnline has no future forecast frames');
 
-    const steps = Array.from({ length: FORECAST_HORIZON_SECONDS / FORECAST_STEP_SECONDS + 1 },
+    const steps = Array.from({ length: FORECAST_HORIZON_SECONDS / FORECAST_FRAME_SECONDS + 1 },
         function (_, index) {
-            const time = startTime + index * FORECAST_STEP_SECONDS;
+            const time = startTime + index * FORECAST_FRAME_SECONDS;
             const nextIndex = availableFrames.findIndex(function (frame) { return frame.time >= time; });
             if (nextIndex === -1) {
                 const after = availableFrames[availableFrames.length - 1];
@@ -527,7 +528,7 @@ async function generateForecastGif(location) {
             .png()
             .toBuffer();
         console.info('[forecast] frame ' + (frameIndex + 1) + '/' + steps.length +
-            ' (+ ' + (frameIndex * FORECAST_STEP_SECONDS / 60) + ' min) completed in ' +
+            ' (+ ' + (frameIndex * FORECAST_FRAME_SECONDS / 60) + ' min) completed in ' +
             ((Date.now() - frameStartedAt) / 1000).toFixed(2) + 's; render elapsed ' +
             ((Date.now() - renderStartedAt) / 1000).toFixed(1) + 's');
         return image;
