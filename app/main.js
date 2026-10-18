@@ -65,14 +65,17 @@ function buildCityOverlaySvg(cities, zoom, center) {
     return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' + text + '</svg>');
 }
 
-function buildTimeOverlaySvg(timestamp) {
+function buildTimeOverlaySvg(timestamp, progress) {
     const time = new Intl.DateTimeFormat('de-DE', {
         hour: '2-digit',
         minute: '2-digit',
         timeZone: 'Europe/Berlin'
     }).format(new Date(timestamp * 1000));
+    const progressWidth = 512 * Math.max(0, Math.min(1, Number(progress) || 0));
     return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' +
         '<rect x="0" y="452" width="512" height="60" fill="#fff" fill-opacity="0.7"/>' +
+        '<rect x="0" y="452" width="' + progressWidth.toFixed(1) + '" height="60"' +
+        ' fill="#172a35" fill-opacity="0.3"/>' +
         '<text x="256" y="482" text-anchor="middle" dominant-baseline="central"' +
         ' font-family="Fira Sans,sans-serif" font-size="50" font-weight="600" fill="#172a35">' +
         time + '</text></svg>');
@@ -517,7 +520,10 @@ async function generateForecastGif(location) {
                 .toBuffer();
         }
         const image = await sharp(centeredFrame)
-            .composite([{ input: buildTimeOverlaySvg(step.time) }])
+            .composite([{
+                input: buildTimeOverlaySvg(step.time,
+                    steps.length > 1 ? frameIndex / (steps.length - 1) : 1)
+            }])
             .png()
             .toBuffer();
         console.info('[forecast] frame ' + (frameIndex + 1) + '/' + steps.length +
