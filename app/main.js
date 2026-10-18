@@ -195,7 +195,9 @@ async function estimateRainFlow(cv, sourceBuffer, targetBuffer) {
     try {
         sourceMat.data.set(sourceGray);
         targetMat.data.set(targetGray);
-        cv.calcOpticalFlowFarneback(sourceMat, targetMat, flowMat, 0.5, 4, 21, 4, 5, 1.2, 0);
+        // A Gaussian window tracks moving rain cells more closely than the default box filter.
+        cv.calcOpticalFlowFarneback(sourceMat, targetMat, flowMat, 0.5, 5, 41, 6, 7, 1.5,
+            cv.OPTFLOW_FARNEBACK_GAUSSIAN);
         return Float32Array.from(flowMat.data32F);
     } finally {
         sourceMat.delete();
@@ -204,51 +206,178 @@ async function estimateRainFlow(cv, sourceBuffer, targetBuffer) {
     }
 }
 
-function advectRainImage(source, flow, fraction) {
-    const pixelCount = 512 * 512;
-    const output = Buffer.alloc(pixelCount * 4);
+const RAIN_DISTANCE_LIMIT = 24;
 
-    function sampleField(x, y, channel) {
-        const left = Math.max(0, Math.min(511, Math.floor(x)));
-        const top = Math.max(0, Math.min(511, Math.floor(y)));
-        const right = Math.min(511, left + 1);
-        const bottom = Math.min(511, top + 1);
-        const dx = Math.max(0, Math.min(1, x - left));
-        const dy = Math.max(0, Math.min(1, y - top));
-        const upper = flow[(top * 512 + left) * 2 + channel] * (1 - dx) +
-            flow[(top * 512 + right) * 2 + channel] * dx;
-        const lower = flow[(bottom * 512 + left) * 2 + channel] * (1 - dx) +
-            flow[(bottom * 512 + right) * 2 + channel] * dx;
-        return upper * (1 - dy) + lower * dy;
-    }
+function sampleBilinear(field, stride, channel, x, y) {
+    const left = Math.max(0, Math.min(511, Math.floor(x)));
+    const top = Math.max(0, Math.min(511, Math.floor(y)));
+    const right = Math.min(511, left + 1);
+    const bottom = Math.min(511, top + 1);
+    const dx = Math.max(0, Math.min(1, x - left));
+    const dy = Math.max(0, Math.min(1, y - top));
+    const upper = field[(top * 512 + left) * stride + channel] * (1 - dx) +
+        field[(top * 512 + right) * stride + channel] * dx;
+    const lower = field[(bottom * 512 + left) * stride + channel] * (1 - dx) +
+        field[(bottom * 512 + right) * stride + channel] * dx;
+    return upper * (1 - dy) + lower * dy;
+}
 
-    function sampleColor(x, y, channel) {
-        const left = Math.max(0, Math.min(511, Math.floor(x)));
-        const top = Math.max(0, Math.min(511, Math.floor(y)));
-        const right = Math.min(511, left + 1);
-        const bottom = Math.min(511, top + 1);
-        const dx = Math.max(0, Math.min(1, x - left));
-        const dy = Math.max(0, Math.min(1, y - top));
-        const upper = source[(top * 512 + left) * 4 + channel] * (1 - dx) +
-            source[(top * 512 + right) * 4 + channel] * dx;
-        const lower = source[(bottom * 512 + left) * 4 + channel] * (1 - dx) +
-            source[(bottom * 512 + right) * 4 + channel] * dx;
-        return Math.round(upper * (1 - dy) + lower * dy);
-    }
-
+// For each output pixel, find where it came from when moving `fraction` of the way along `flow`.
+function computeSourcePositions(flow, fraction) {
+    const positions = new Float32Array(512 * 512 * 2);
     for (let y = 0; y < 512; y += 1) {
         for (let x = 0; x < 512; x += 1) {
             let sourceX = x;
             let sourceY = y;
             for (let iteration = 0; iteration < 3; iteration += 1) {
-                sourceX = x - sampleField(sourceX, sourceY, 0) * fraction;
-                sourceY = y - sampleField(sourceX, sourceY, 1) * fraction;
+                sourceX = x - sampleBilinear(flow, 2, 0, sourceX, sourceY) * fraction;
+                sourceY = y - sampleBilinear(flow, 2, 1, sourceX, sourceY) * fraction;
             }
-            const outputOffset = (y * 512 + x) * 4;
-            for (let channel = 0; channel < 4; channel += 1) {
-                output[outputOffset + channel] = sampleColor(sourceX, sourceY, channel);
+            positions[(y * 512 + x) * 2] = sourceX;
+            positions[(y * 512 + x) * 2 + 1] = sourceY;
+        }
+    }
+    return positions;
+}
+
+// Radar imagery uses a few flat colour bands; noisy near-duplicates and anti-aliased edges are
+// ignored by only counting pixels whose four neighbours share the exact same colour.
+function buildRainPalette(images) {
+    const counts = new Map();
+    for (const image of images) {
+        for (let y = 1; y < 511; y += 1) {
+            for (let x = 1; x < 511; x += 1) {
+                const offset = (y * 512 + x) * 4;
+                if (image[offset + 3] < 128) continue;
+                const color = image.readUInt32BE(offset);
+                if (image.readUInt32BE(offset - 4) !== color || image.readUInt32BE(offset + 4) !== color ||
+                    image.readUInt32BE(offset - 2048) !== color || image.readUInt32BE(offset + 2048) !== color) {
+                    continue;
+                }
+                counts.set(color, (counts.get(color) || 0) + 1);
             }
         }
+    }
+    const palette = [];
+    Array.from(counts.entries()).sort(function (left, right) { return right[1] - left[1]; })
+        .forEach(function (entry) {
+            if (entry[1] < 16 || palette.length >= 32) return;
+            const color = [entry[0] >>> 24, (entry[0] >>> 16) & 255, (entry[0] >>> 8) & 255, entry[0] & 255];
+            const isDuplicate = palette.some(function (existing) {
+                return Math.hypot(existing[0] - color[0], existing[1] - color[1], existing[2] - color[2]) < 16;
+            });
+            if (!isDuplicate) palette.push(color);
+        });
+    return palette;
+}
+
+function labelRainImage(image, palette) {
+    const labels = new Uint8Array(512 * 512);
+    if (!palette.length) return labels;
+    for (let pixel = 0; pixel < labels.length; pixel += 1) {
+        const offset = pixel * 4;
+        if (image[offset + 3] < 128) continue;
+        let best = 0;
+        let bestDistance = Infinity;
+        for (let index = 0; index < palette.length; index += 1) {
+            const distance = (image[offset] - palette[index][0]) ** 2 +
+                (image[offset + 1] - palette[index][1]) ** 2 +
+                (image[offset + 2] - palette[index][2]) ** 2;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = index;
+            }
+        }
+        labels[pixel] = best + 1;
+    }
+    return labels;
+}
+
+// Signed distance (negative inside) to each colour band's region, clamped so that new cells grow
+// from nearby rather than popping in at the very end of an interval.
+function computeRainDistanceFields(cv, labels, labelCount) {
+    const fields = new Array(labelCount).fill(null);
+    const mask = new cv.Mat(512, 512, cv.CV_8UC1);
+    const inverse = new cv.Mat(512, 512, cv.CV_8UC1);
+    const inside = new cv.Mat();
+    const outside = new cv.Mat();
+    try {
+        for (let label = 0; label < labelCount; label += 1) {
+            let present = false;
+            for (let pixel = 0; pixel < labels.length; pixel += 1) {
+                const isLabel = labels[pixel] === label;
+                mask.data[pixel] = isLabel ? 255 : 0;
+                inverse.data[pixel] = isLabel ? 0 : 255;
+                present = present || isLabel;
+            }
+            if (!present) continue;
+            cv.distanceTransform(mask, inside, cv.DIST_L2, 5);
+            cv.distanceTransform(inverse, outside, cv.DIST_L2, 5);
+            const field = new Float32Array(labels.length);
+            for (let pixel = 0; pixel < labels.length; pixel += 1) {
+                const distance = labels[pixel] === label ?
+                    0.5 - inside.data32F[pixel] : outside.data32F[pixel] - 0.5;
+                field[pixel] = Math.max(-RAIN_DISTANCE_LIMIT, Math.min(RAIN_DISTANCE_LIMIT, distance));
+            }
+            fields[label] = field;
+        }
+    } finally {
+        mask.delete();
+        inverse.delete();
+        outside.delete();
+        inside.delete();
+    }
+    return fields;
+}
+
+// Moves each source's colour-band regions along its flow, interpolates their boundaries, and paints
+// every pixel with the band it lies deepest inside. Regions only move, grow, or shrink.
+function renderMorphedRain(sources, palette) {
+    const colors = [[0, 0, 0, 0]].concat(palette);
+    const activeLabels = colors.map(function (_, label) { return label; }).filter(function (label) {
+        return label === 0 || sources.some(function (source) { return source.fields[label]; });
+    });
+    const output = Buffer.alloc(512 * 512 * 4);
+    for (let pixel = 0; pixel < 512 * 512; pixel += 1) {
+        let best = 0;
+        let bestDistance = Infinity;
+        let second = 0;
+        let secondDistance = Infinity;
+        for (const label of activeLabels) {
+            let distance = 0;
+            for (const source of sources) {
+                const field = source.fields[label];
+                let value = RAIN_DISTANCE_LIMIT;
+                if (field) {
+                    value = source.positions ?
+                        sampleBilinear(field, 1, 0, source.positions[pixel * 2], source.positions[pixel * 2 + 1]) :
+                        field[pixel];
+                }
+                distance += value * source.weight;
+            }
+            if (distance < bestDistance) {
+                second = best;
+                secondDistance = bestDistance;
+                best = label;
+                bestDistance = distance;
+            } else if (distance < secondDistance) {
+                second = label;
+                secondDistance = distance;
+            }
+        }
+        // Anti-alias only where two bands meet within a pixel.
+        const coverage = Math.max(0.5, Math.min(1, 0.5 + (secondDistance - bestDistance) / 2));
+        const first = colors[best];
+        const other = colors[second];
+        const firstAlpha = first[3] * coverage;
+        const otherAlpha = other[3] * (1 - coverage);
+        const alpha = firstAlpha + otherAlpha;
+        const offset = pixel * 4;
+        if (alpha === 0) continue;
+        for (let channel = 0; channel < 3; channel += 1) {
+            output[offset + channel] = Math.round((first[channel] * firstAlpha + other[channel] * otherAlpha) / alpha);
+        }
+        output[offset + 3] = Math.round(alpha);
     }
     return output;
 }
@@ -479,28 +608,51 @@ async function generateForecastGif(location) {
         return flowByPair.get(key);
     }
 
+    const rainPalette = await Promise.all(uniqueFrames.map(getRawRain)).then(function (images) {
+        return buildRainPalette(images.map(function (image) { return image.data; }));
+    });
+    const fieldsById = new Map();
+    function getDistanceFields(frame) {
+        if (!fieldsById.has(frame.id)) {
+            fieldsById.set(frame.id, getRawRain(frame).then(function (image) {
+                return computeRainDistanceFields(cv, labelRainImage(image.data, rainPalette),
+                    rainPalette.length + 1);
+            }));
+        }
+        return fieldsById.get(frame.id);
+    }
+
+    async function morphSource(frame, flowSource, flowTarget, fraction, weight) {
+        const [fields, flow] = await Promise.all([
+            getDistanceFields(frame),
+            fraction === 0 ? null : getFlow(flowSource, flowTarget)
+        ]);
+        return {
+            fields: fields,
+            positions: flow ? computeSourcePositions(flow, fraction) : null,
+            weight: weight
+        };
+    }
+
     const outputStartedAt = Date.now();
     const images = await mapWithConcurrency(steps, 3, async function (step, frameIndex) {
         const frameStartedAt = Date.now();
-        let rainImage = rainImageById.get(step.before.id);
-        if (step.before.id !== step.after.id && step.amount > 0) {
-            const useAfter = step.amount > 0.5;
-            const sourceFrame = step.extrapolate ? step.after :
-                (useAfter ? step.after : step.before);
-            const flowSource = step.extrapolate ? step.before : sourceFrame;
-            const flowTarget = step.extrapolate ? step.after :
-                (useAfter ? step.before : step.after);
-            const fraction = step.extrapolate ? step.amount - 1 :
-                (useAfter ? 1 - step.amount : step.amount);
-            const [source, flow] = await Promise.all([
-                getRawRain(sourceFrame),
-                getFlow(flowSource, flowTarget)
+        let sources;
+        if (step.extrapolate) {
+            sources = [await morphSource(step.after, step.before, step.after, step.amount - 1, 1)];
+        } else if (step.before.id === step.after.id || step.amount === 0) {
+            sources = [await morphSource(step.before, null, null, 0, 1)];
+        } else if (step.amount === 1) {
+            sources = [await morphSource(step.after, null, null, 0, 1)];
+        } else {
+            sources = await Promise.all([
+                morphSource(step.before, step.before, step.after, step.amount, 1 - step.amount),
+                morphSource(step.after, step.after, step.before, 1 - step.amount, step.amount)
             ]);
-            const advected = advectRainImage(source.data, flow, fraction);
-            rainImage = await sharp(advected, {
-                raw: { width: 512, height: 512, channels: 4 }
-            }).png().toBuffer();
         }
+        const rainImage = await sharp(renderMorphedRain(sources, rainPalette), {
+            raw: { width: 512, height: 512, channels: 4 }
+        }).png().toBuffer();
 
         let mapFrame = await sharp(baseImage).composite([{ input: rainImage }]).png().toBuffer();
         // Dark theme inverts only the WetterOnline imagery; city labels and the time box stay as-is.
