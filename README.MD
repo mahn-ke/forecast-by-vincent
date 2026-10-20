@@ -2,7 +2,7 @@
 
 Hosts the container serving [forecast.by.vincent.mahn.ke](https://forecast.by.vincent.mahn.ke).
 
-`GET /forecast?x=<longitude>&y=<latitude>&zoom=<2..100>&theme=<light|dark>&label=<0|1>&noFooter=<0|1>` returns the
+`GET /forecast?x=<longitude>&y=<latitude>&zoom=<2..100>&theme=<light|dark>&label=<0|1>&noFooter=<0|1>&alpha=<0|1>` returns the
 animation as an AV1 MP4 (`video/mp4`, 10 fps, about 40–60 KB; roughly 1/20 of an equivalent GIF).
 `X-Forecast-Frames` and `X-Forecast-Frame-Delay-Ms` describe the animation.
 It has one frame per minute for the next 90 minutes. Rain between WetterOnline's 5- and 15-minute forecast
@@ -14,6 +14,12 @@ remain visible in either mode. `theme` defaults to `light`. With `theme=dark`, t
 rain imagery are colour-inverted, while city labels and the time box stay unchanged.
 `noFooter=1` omits the time box and progress bar so clients can draw their own. Frames then only change
 where rain moves, which makes the video smaller (about 60% with little rain, 10% with a lot).
+`alpha=1` omits the basemap, labels, and footer and returns only the rain imagery over black.
+MP4 does not provide dependable alpha-channel playback across clients, so request the synchronized
+white-on-black opacity video from `GET /alpha` with the same location, zoom, and theme parameters.
+Use that video as the alpha channel for the rain-only `/forecast?...&alpha=1` video. White means opaque
+rain, black means transparent; the mask is independent of `theme`. For `theme=dark`, only the rain
+colors are inverted. Both videos have matching frame counts and timestamps and use AV1 in MP4.
 Frame `i` of `n` shows `X-Forecast-Start + i/(n-1) * (X-Forecast-End - X-Forecast-Start)`;
 `X-Forecast-No-Footer` reports which variant was served.
 

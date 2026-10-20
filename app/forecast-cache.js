@@ -18,7 +18,8 @@ export function createForecastCache(generateForecastVideo) {
                 zoom: location.zoom === undefined ? 'provider-max' : location.zoom,
                 theme: location.theme || 'light',
                 label: location.label === 1 ? 1 : 0,
-                noFooter: location.noFooter === 1 ? 1 : 0
+                noFooter: location.noFooter === 1 ? 1 : 0,
+                alpha: location.alpha === 1
             });
             generation = generateForecastVideo(location).then(function (result) {
                 const nextBoundary = (Math.floor(generationStartedAt / FORECAST_INTERVAL_MS) + 1) *
@@ -27,7 +28,9 @@ export function createForecastCache(generateForecastVideo) {
                     ...result,
                     expiresAt: nextBoundary,
                     staleUntil: nextBoundary + FORECAST_CACHE_GRACE_MS,
-                    etag: '"' + createHash('sha256').update(result.data).digest('hex') + '"'
+                    etag: '"' + createHash('sha256').update(result.data).digest('hex') + '"',
+                    alphaEtag: result.alphaData ?
+                        '"' + createHash('sha256').update(result.alphaData).digest('hex') + '"' : undefined
                 };
                 if (Date.now() < entry.staleUntil) {
                     forecastCache.set(cacheKey, entry);
@@ -63,7 +66,8 @@ export function createForecastCache(generateForecastVideo) {
         const cacheKey = [location.x.toFixed(6), location.y.toFixed(6),
             location.zoom === undefined ? 'max' : String(location.zoom), location.theme || 'light',
             location.label === 1 ? '1' : '0',
-            location.noFooter === 1 ? '1' : '0'].join(':');
+            location.noFooter === 1 ? '1' : '0',
+            location.alpha === 1 ? '1' : '0'].join(':');
         for (const [key, entry] of forecastCache) {
             if (Date.now() >= entry.staleUntil) forecastCache.delete(key);
         }
@@ -91,14 +95,15 @@ export function createForecastCache(generateForecastVideo) {
     };
 }
 
-export function forecastResponseHeaders(result, stale) {
+export function forecastResponseHeaders(result, stale, alphaMask = false) {
     const maxAge = Math.max(0, Math.floor((result.expiresAt - Date.now()) / 1000));
+    const data = alphaMask ? result.alphaData : result.data;
     return {
         'Content-Type': 'video/mp4',
-        'Content-Length': result.data.length,
+        'Content-Length': data.length,
         'Cache-Control': 'public, max-age=' + maxAge + ', must-revalidate',
         'Expires': new Date(result.expiresAt).toUTCString(),
-        'ETag': result.etag,
+        'ETag': alphaMask ? result.alphaEtag : result.etag,
         'X-Forecast-Stale': String(stale),
         'X-Forecast-Zoom': String(result.zoom),
         'X-Forecast-Source-Zoom': String(result.sourceZoom),
@@ -106,7 +111,9 @@ export function forecastResponseHeaders(result, stale) {
         'X-Forecast-Y': String(result.y),
         'X-Forecast-Theme': result.theme || 'light',
         'X-Forecast-Label': result.label === 1 ? '1' : '0',
-        'X-Forecast-No-Footer': result.noFooter === 1 ? '1' : '0',
+        'X-Forecast-Alpha': result.alpha === 1 ? '1' : '0',
+        'X-Forecast-Alpha-Mask': alphaMask ? '1' : '0',
+        'X-Forecast-No-Footer': result.noFooter === 1 || result.alpha === 1 ? '1' : '0',
         'X-Forecast-Frames': String(result.frames),
         'X-Forecast-Frame-Delay-Ms': String(result.frameDelayMs),
         'X-Forecast-Start': new Date(result.start * 1000).toISOString(),

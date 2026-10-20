@@ -480,7 +480,8 @@ async function generateForecastVideo(location) {
         x: location.x,
         y: location.y,
         zoom: location.zoom === undefined ? 'provider-max' : location.zoom,
-        theme: location.theme
+        theme: location.theme,
+        alpha: location.alpha === 1
     });
     const metadataUrls = [
         'https://tiles.wo-cloud.com/metadata?type=geo',
@@ -571,12 +572,14 @@ async function generateForecastVideo(location) {
     });
     const uniqueFrames = Array.from(sourceFrames.values());
     const center = projectMercator(location.y, location.x, sourceZoom);
-    const cityOverlay = location.label === 1 ? buildCityOverlaySvg(cities, sourceZoom, center) : null;
+    const cityOverlay = location.alpha !== 1 && location.label === 1 ?
+        buildCityOverlaySvg(cities, sourceZoom, center) : null;
     const geoTileCache = new Map();
     let nativeFramesCompleted = 0;
     const nativeFrameStartedAt = Date.now();
     const [baseImage, renderedRainFrames] = await Promise.all([
-        renderHamburgFrame(null, geo, sourceZoom, center, geoTileCache, 'base'),
+        location.alpha === 1 ? null :
+            renderHamburgFrame(null, geo, sourceZoom, center, geoTileCache, 'base'),
         mapWithConcurrency(uniqueFrames, 3, async function (frame) {
             const image = await renderHamburgFrame(frame, geo, sourceZoom, center, new Map(), 'rain');
             nativeFramesCompleted += 1;
@@ -638,6 +641,17 @@ async function generateForecastVideo(location) {
         };
     }
 
+    async function applyOverzoom(image) {
+        if (overzoomScale <= 1) return image;
+        const cropSize = Math.max(1, Math.round(512 / overzoomScale));
+        const cropStart = Math.floor((512 - cropSize) / 2);
+        return sharp(image)
+            .extract({ left: cropStart, top: cropStart, width: cropSize, height: cropSize })
+            .resize(512, 512, { fit: 'fill' })
+            .png()
+            .toBuffer();
+    }
+
     const outputStartedAt = Date.now();
     const images = await mapWithConcurrency(steps, 3, async function (step, frameIndex) {
         const frameStartedAt = Date.now();
@@ -658,6 +672,22 @@ async function generateForecastVideo(location) {
             raw: { width: 512, height: 512, channels: 4 }
         }).png().toBuffer();
 
+        if (location.alpha === 1) {
+            let rainColor = rainImage;
+            if (location.theme === 'dark') {
+                rainColor = await sharp(rainColor).negate({ alpha: false }).png().toBuffer();
+            }
+            const colorFrame = await applyOverzoom(await sharp(rainColor)
+                .flatten({ background: '#000' })
+                .png()
+                .toBuffer());
+            const alphaFrame = await applyOverzoom(
+                await sharp(rainImage).extractChannel(3).png().toBuffer());
+            console.info('[forecast] rain-only frame ' + (frameIndex + 1) + '/' + steps.length +
+                ' completed in ' + ((Date.now() - frameStartedAt) / 1000).toFixed(2) + 's');
+            return { color: colorFrame, alpha: alphaFrame };
+        }
+
         let mapFrame = await sharp(baseImage).composite([{ input: rainImage }]).png().toBuffer();
         // Dark theme inverts only the WetterOnline imagery; city labels and the time box stay as-is.
         if (location.theme === 'dark') {
@@ -666,16 +696,7 @@ async function generateForecastVideo(location) {
         if (cityOverlay) {
             mapFrame = await sharp(mapFrame).composite([{ input: cityOverlay }]).png().toBuffer();
         }
-        let centeredFrame = mapFrame;
-        if (overzoomScale > 1) {
-            const cropSize = Math.max(1, Math.round(512 / overzoomScale));
-            const cropStart = Math.floor((512 - cropSize) / 2);
-            centeredFrame = await sharp(mapFrame)
-                .extract({ left: cropStart, top: cropStart, width: cropSize, height: cropSize })
-                .resize(512, 512, { fit: 'fill' })
-                .png()
-                .toBuffer();
-        }
+        const centeredFrame = await applyOverzoom(mapFrame);
         // With noFooter the client draws the time box, so static rain yields identical frames.
         const image = location.noFooter === 1 ? centeredFrame : await sharp(centeredFrame)
             .composite([{
@@ -690,7 +711,10 @@ async function generateForecastVideo(location) {
             ((Date.now() - renderStartedAt) / 1000).toFixed(1) + 's');
         return image;
     });
-    const data = await encodeAv1Video(images);
+    const data = await encodeAv1Video(location.alpha === 1 ?
+        images.map(function (image) { return image.color; }) : images);
+    const alphaData = location.alpha === 1 ?
+        await encodeAv1Video(images.map(function (image) { return image.alpha; }), 40) : undefined;
     console.info('[forecast] AV1 encoded', {
         frames: steps.length,
         bytes: data.length,
@@ -707,15 +731,17 @@ async function generateForecastVideo(location) {
         y: location.y,
         theme: location.theme,
         label: location.label === 1 ? 1 : 0,
-        noFooter: location.noFooter === 1 ? 1 : 0,
+        alpha: location.alpha === 1 ? 1 : 0,
+        noFooter: location.alpha === 1 || location.noFooter === 1 ? 1 : 0,
         start: steps[0].time,
         end: steps[steps.length - 1].time,
-        frames: steps.length
+        frames: steps.length,
+        alphaData: alphaData
     };
 }
 
 // CRF 48 keeps map lines and rain edges crisp at roughly 1/20 of an equivalent GIF's size.
-async function encodeAv1Video(pngFrames) {
+async function encodeAv1Video(pngFrames, crf = 48) {
     const directory = await mkdtemp(path.join(tmpdir(), 'forecast-av1-'));
     const output = path.join(directory, 'forecast.mp4');
     try {
@@ -723,7 +749,7 @@ async function encodeAv1Video(pngFrames) {
             const ffmpeg = spawn('ffmpeg', [
                 '-hide_banner', '-loglevel', 'error', '-y',
                 '-f', 'image2pipe', '-framerate', String(1000 / FORECAST_FRAME_DELAY_MS), '-c:v', 'png', '-i', '-',
-                '-c:v', 'libsvtav1', '-preset', '6', '-crf', '48', '-pix_fmt', 'yuv420p',
+                '-c:v', 'libsvtav1', '-preset', '6', '-crf', String(crf), '-pix_fmt', 'yuv420p',
                 '-svtav1-params', 'lp=2',
                 '-movflags', '+faststart', output
             ], { stdio: ['pipe', 'ignore', 'pipe'] });
@@ -754,7 +780,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const requestUrl = new URL(req.url, 'http://localhost');
-    if (requestUrl.pathname === '/forecast') {
+    if (requestUrl.pathname === '/forecast' || requestUrl.pathname === '/alpha') {
         if (req.method !== 'GET') {
             res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8', 'Allow': 'GET' });
             res.end('Method not allowed');
@@ -768,13 +794,16 @@ const server = http.createServer(async (req, res) => {
             const themeParameter = requestUrl.searchParams.get('theme');
             const labelParameter = requestUrl.searchParams.get('label');
             const noFooterParameter = requestUrl.searchParams.get('noFooter');
+            const alphaParameter = requestUrl.searchParams.get('alpha');
+            const alpha = requestUrl.pathname === '/alpha' || alphaParameter === '1';
             const location = {
                 x: xParameter === null ? HAMBURG.longitude : Number(xParameter),
                 y: yParameter === null ? HAMBURG.latitude : Number(yParameter),
                 zoom: zoomParameter === null ? undefined : Number(zoomParameter),
                 theme: themeParameter === null ? 'light' : themeParameter,
-                label: labelParameter === '1' ? 1 : 0,
-                noFooter: noFooterParameter === '1' ? 1 : 0
+                label: alpha ? 0 : (labelParameter === '1' ? 1 : 0),
+                noFooter: alpha || noFooterParameter === '1' ? 1 : 0,
+                alpha: alpha ? 1 : 0
             };
 
             if (!Number.isFinite(location.x) || location.x < -180 || location.x > 180 ||
@@ -803,17 +832,25 @@ const server = http.createServer(async (req, res) => {
                 error.statusCode = 400;
                 throw error;
             }
+            if (alphaParameter !== null && alphaParameter !== '0' && alphaParameter !== '1') {
+                const error = new RangeError('alpha must be 0 or 1');
+                error.statusCode = 400;
+                throw error;
+            }
 
             const cached = await getCachedForecastVideo(location);
             const result = cached.result;
-            const headers = forecastResponseHeaders(result, cached.stale);
-            if (req.headers['if-none-match'] === result.etag) {
+            const alphaMask = requestUrl.pathname === '/alpha';
+            const data = alphaMask ? result.alphaData : result.data;
+            const etag = alphaMask ? result.alphaEtag : result.etag;
+            const headers = forecastResponseHeaders(result, cached.stale, alphaMask);
+            if (req.headers['if-none-match'] === etag) {
                 res.writeHead(304, headers);
                 res.end();
                 return;
             }
             res.writeHead(200, headers);
-            res.end(result.data);
+            res.end(data);
         } catch (error) {
             console.error('Forecast generation failed:', error);
             res.writeHead(error.statusCode || 502, {
@@ -831,6 +868,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
+    if (process.env.FORECAST_DISABLE_WARMUP === '1') return;
     const defaultLocation = { x: HAMBURG.longitude, y: HAMBURG.latitude };
     const warmupStartedAt = Date.now();
     console.info('[forecast] startup warm-up started', defaultLocation);
