@@ -90,6 +90,24 @@ function providerPath(...parts) {
     return parts.join('/').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
 }
 
+function tileIntersectsEurope(geo, zoom, tileX, tileY) {
+    const bounds = geo.subAreas && geo.subAreas.europe && geo.subAreas.europe.bounds;
+    if (!bounds) return true;
+    const north = Math.max(bounds[0][0], bounds[1][0]);
+    const south = Math.min(bounds[0][0], bounds[1][0]);
+    const west = Math.min(bounds[0][1], bounds[1][1]);
+    const east = Math.max(bounds[0][1], bounds[1][1]);
+    const tiles = Math.pow(2, zoom - 1);
+    const tileWest = tileX / tiles * 360 - 180;
+    const tileEast = (tileX + 1) / tiles * 360 - 180;
+    function latitude(y) {
+        return Math.atan(Math.sinh(Math.PI * (1 - 2 * y / tiles))) * 180 / Math.PI;
+    }
+    const tileNorth = latitude(tileY);
+    const tileSouth = latitude(tileY + 1);
+    return tileEast > west && tileWest < east && tileNorth > south && tileSouth < north;
+}
+
 function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY, options) {
     const includeBase = options.includeBase;
     const includeRain = options.includeRain;
@@ -104,7 +122,10 @@ function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY, options) {
         baseTile + '.' + (topography.type[topographyIndex] || 'jpg'));
     const europeRain = frame && frame.layers.europe && frame.layers.europe.rain;
     const globalRain = frame && frame.layers.global && frame.layers.global.rain;
-    const rainZoom = Math.min(zoom, (europeRain && europeRain.mnz) || 7);
+    // Europe radar only covers its sub-area; elsewhere WetterOnline draws the global sprite at its own zoom.
+    const outsideEurope = !tileIntersectsEurope(geo, zoom, tileX, tileY);
+    const rainZoom = Math.min(zoom, (outsideEurope ? globalRain && globalRain.mnz :
+        europeRain && europeRain.mnz) || 7);
     const rainScale = Math.pow(2, zoom - rainZoom);
     const rainBaseX = Math.floor(tileX / rainScale) * 2;
     const rainBaseY = Math.floor(tileY / rainScale) * 2;
@@ -117,7 +138,8 @@ function buildCompositeTileUrl(frame, geo, zoom, tileX, tileY, options) {
             'ZL' + rainZoom + '/522/' + kind + '/' + rainBaseX + '_' + rainBaseY + '.png');
     }
 
-    const rainPaths = [rainPath(europeRain, 'sprite'), rainPath(globalRain, 'border')]
+    const rainPaths = (outsideEurope ? [rainPath(globalRain, 'sprite')] :
+        [rainPath(europeRain, 'sprite'), rainPath(globalRain, 'border')])
         .filter(Boolean).join(';');
     const layers = [];
     if (includeBase) {

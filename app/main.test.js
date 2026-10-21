@@ -38,7 +38,8 @@ test('forecast labels are opt-in in HTTP requests and rendered AV1 videos', asyn
         timeRangeConfig: {
             periodCurrentHighRes: { timeResolution: { 2: 5 } },
             periodCurrentLowRes: { timeResolution: { 2: 15 } }
-        }
+        },
+        subAreas: { europe: { bounds: [[66.5133, -22.5], [21.943, 45.0]] } }
     };
     const future = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
     const frameId = future.slice(0, 10).replaceAll('-', '') + '-' +
@@ -48,6 +49,9 @@ test('forecast labels are opt-in in HTTP requests and rendered AV1 videos', asyn
         layers: {
             europe: {
                 rain: { mnz: 2, ptypPath: 'rain', path: 'forecast', timePath: ['test-time'] }
+            },
+            global: {
+                rain: { mnz: 1, ptypPath: 'global', path: 'forecast', timePath: ['test-time'] }
             }
         }
     }] };
@@ -193,6 +197,16 @@ test('forecast labels are opt-in in HTTP requests and rendered AV1 videos', asyn
         const layers = Buffer.from(url.searchParams.get('tiles'), 'base64').toString();
         return !layers.includes('seamask|') && !layers.includes('topo|');
     }));
+    // Zoom-2 tiles south of the equator lie outside the European radar and use the global sprite.
+    const alphaLayers = alphaRequests.map(url => Buffer.from(url.searchParams.get('tiles'), 'base64').toString());
+    const europeTiles = alphaLayers.filter(layers => layers.includes('rain/forecast/'));
+    const globalTiles = alphaLayers.filter(layers => !layers.includes('rain/forecast/'));
+    assert.equal(europeTiles.length, 2);
+    assert.ok(europeTiles.every(layers => layers.includes('/ZL2/522/sprite/') &&
+        layers.includes('global/forecast/test-time/ZL2/522/border/')));
+    assert.equal(globalTiles.length, 2);
+    assert.ok(globalTiles.every(layers => layers.startsWith('r|2;;') &&
+        layers.includes('global/forecast/test-time/ZL1/522/sprite/') && !layers.includes('/border/')));
     assert.equal(fetchMock.mock.calls.slice(beforeAlpha)
         .some(call => String(call.arguments[0]).includes('/geo-overlay/')), false);
     const callsAfterAlphaGeneration = fetchMock.mock.callCount();

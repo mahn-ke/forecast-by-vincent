@@ -22,6 +22,8 @@ rain, black means transparent; the mask is independent of `theme`. For `theme=da
 colors are inverted. Both videos have matching frame counts and timestamps and use AV1 in MP4.
 Frame `i` of `n` shows `X-Forecast-Start + i/(n-1) * (X-Forecast-End - X-Forecast-Start)`;
 `X-Forecast-No-Footer` reports which variant was served.
+Map tiles inside WetterOnline's European radar area use the European rain layer; tiles entirely
+outside it (for example the Caribbean) use the global rain layer at its own maximum zoom.
 
 Forecasts are cached per location, zoom, theme, label, and footer setting until the next five-minute clock
 boundary. During the following 60 seconds, the previous video may be served while
